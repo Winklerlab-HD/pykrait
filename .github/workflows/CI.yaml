@@ -1,0 +1,99 @@
+name: Run tests and lint with Ruff
+
+permissions:
+  contents: read
+  checks: write
+  pull-requests: write
+
+on:
+  pull_request:
+  push:
+    branches: [ main, develop ]
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    name: Ruff lint
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install Ruff
+        run: pip install ruff
+
+      - name: Check formatting with Ruff
+        run: |
+          if ! ruff format --check src; then
+            echo "::warning::Code is not formatted correctly. Run 'ruff format src' locally."
+          fi
+
+  tests:
+    name: Python ${{ matrix.python }} • ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        python: ["3.11", "3.12", "3.13"]
+
+    steps:
+      # based on https://github.com/actions/runner-images/issues/2840#issuecomment-790492173
+      # free up some space on the Linux runners
+      - name: Free up space
+        if: runner.os == 'Linux'
+        run: |
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /opt/ghc
+          sudo rm -rf "$AGENT_TOOLSDIRECTORY"
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install .[dev]
+          # Add plugin for inline failure annotations
+          pip install pytest-github-actions-annotate-failures
+
+      - name: Show versions
+        run: |
+          python -V
+          pip -V
+
+      - name: Run tests
+        shell: bash
+        run: |
+          pytest -vv -ra --color=yes --durations=15 \
+            --junitxml=reports/junit.xml \
+            --cov=pykrait --cov-report=xml:reports/coverage.xml
+
+      - name: Upload test reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: reports-${{ matrix.os }}-py${{ matrix.python }}
+          path: reports/
+
+      - name: Report test results
+        if: always()
+        uses: dorny/test-reporter@v1
+        with:
+          name: pytest results (${{ matrix.os }} py${{ matrix.python }})
+          path: reports/junit.xml
+          reporter: java-junit

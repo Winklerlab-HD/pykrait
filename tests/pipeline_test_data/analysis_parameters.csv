@@ -1,0 +1,2 @@
+tproj_type,CLAHE_normalize,cellpose_model_path,frame_interval,neighbour_tolerance,sinc_filter_window,peak_min_width,peak_max_width,peak_prominence,peak_min_height,periodicity_method,std_threshold,cov_threshold
+std,True,/Users/nils/Documents/GitHub/pykrait/cellpose_models/DDMel31_cpsam,,5,300,1,80,1000,800,cutoff,15,0.2
