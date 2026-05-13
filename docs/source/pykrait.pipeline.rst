@@ -4,10 +4,13 @@ pykrait.pipeline package
 Submodules
 ----------
 
-.. toctree::
-   :maxdepth: 4
+pykrait.pipeline.pipeline module
+--------------------------------
 
-   pykrait.pipeline.pipeline
+.. automodule:: pykrait.pipeline.pipeline
+   :members:
+   :show-inheritance:
+   :undoc-members:
 
 Module contents
 ---------------

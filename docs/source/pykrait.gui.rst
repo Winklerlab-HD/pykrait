@@ -4,14 +4,45 @@ pykrait.gui package
 Submodules
 ----------
 
-.. toctree::
-   :maxdepth: 4
+pykrait.gui.app module
+----------------------
 
-   pykrait.gui.app
-   pykrait.gui.async_workers
-   pykrait.gui.custom_widgets
-   pykrait.gui.fileselection
-   pykrait.gui.mainwindow
+.. automodule:: pykrait.gui.app
+   :members:
+   :show-inheritance:
+   :undoc-members:
+
+pykrait.gui.async\_workers module
+---------------------------------
+
+.. automodule:: pykrait.gui.async_workers
+   :members:
+   :show-inheritance:
+   :undoc-members:
+
+pykrait.gui.custom\_widgets module
+----------------------------------
+
+.. automodule:: pykrait.gui.custom_widgets
+   :members:
+   :show-inheritance:
+   :undoc-members:
+
+pykrait.gui.fileselection module
+--------------------------------
+
+.. automodule:: pykrait.gui.fileselection
+   :members:
+   :show-inheritance:
+   :undoc-members:
+
+pykrait.gui.mainwindow module
+-----------------------------
+
+.. automodule:: pykrait.gui.mainwindow
+   :members:
+   :show-inheritance:
+   :undoc-members:
 
 Module contents
 ---------------

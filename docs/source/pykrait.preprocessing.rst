@@ -4,11 +4,21 @@ pykrait.preprocessing package
 Submodules
 ----------
 
-.. toctree::
-   :maxdepth: 4
+pykrait.preprocessing.segmentation module
+-----------------------------------------
 
-   pykrait.preprocessing.segmentation
-   pykrait.preprocessing.timeseries_extraction
+.. automodule:: pykrait.preprocessing.segmentation
+   :members:
+   :show-inheritance:
+   :undoc-members:
+
+pykrait.preprocessing.timeseries\_extraction module
+---------------------------------------------------
+
+.. automodule:: pykrait.preprocessing.timeseries_extraction
+   :members:
+   :show-inheritance:
+   :undoc-members:
 
 Module contents
 ---------------

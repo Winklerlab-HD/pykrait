@@ -74,7 +74,11 @@ html_theme_options = {
     "logo": {
         "image_light": "_static/images/pykrait_logo_light.png",
         "image_dark": "_static/images/pykrait_logo_dark.png",
-    }
+    },
+    "navbar_start": ["navbar-logo"],
+    "navbar_center": ["navbar-nav"],
+    "primary_sidebar_end": ["sidebar-ethical-ads"],
+    "navigation_depth": 5,
 }
 
 html_title = f"{project} {version} Documentation"

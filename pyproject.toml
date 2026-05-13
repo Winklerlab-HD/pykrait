@@ -38,7 +38,12 @@ dependencies = [
     "zarr>=2.15.0",
     "pylibczirw>=6.0.1",
 ]
-
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+]
 [project.optional-dependencies]
 gui = [
     "pyside6>=6.9.1",
@@ -102,10 +107,3 @@ skip_covered = true
 src = ["src"]
 line-length = 88
 target-version = "py311"
-
-classifiers = [
-    "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.11",
-    "Programming Language :: Python :: 3.12",
-    "Programming Language :: Python :: 3.13",
-]

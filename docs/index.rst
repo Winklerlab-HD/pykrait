@@ -1,10 +1,8 @@
-pyKrait
-=====================
-
-Welcome to the pyKrait documentation.
+.. include:: welcome.md
+   :parser: myst_parser.sphinx_
 
 .. toctree::
    :hidden:
 
    welcome
-   source/pykrait
+   source/modules

@@ -4,11 +4,21 @@ pykrait.io package
 Submodules
 ----------
 
-.. toctree::
-   :maxdepth: 4
+pykrait.io.files module
+-----------------------
 
-   pykrait.io.files
-   pykrait.io.images
+.. automodule:: pykrait.io.files
+   :members:
+   :show-inheritance:
+   :undoc-members:
+
+pykrait.io.images module
+------------------------
+
+.. automodule:: pykrait.io.images
+   :members:
+   :show-inheritance:
+   :undoc-members:
 
 Module contents
 ---------------

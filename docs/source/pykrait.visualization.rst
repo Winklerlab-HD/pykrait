@@ -4,10 +4,13 @@ pykrait.visualization package
 Submodules
 ----------
 
-.. toctree::
-   :maxdepth: 4
+pykrait.visualization.image\_overlays module
+--------------------------------------------
 
-   pykrait.visualization.image_overlays
+.. automodule:: pykrait.visualization.image_overlays
+   :members:
+   :show-inheritance:
+   :undoc-members:
 
 Module contents
 ---------------

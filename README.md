@@ -1,14 +1,13 @@
 <p align="center">
-  <img src="docs/_static/logo.png" alt="pyKrait" width="200">
+  <img src="https://raw.githubusercontent.com/Winklerlab-HD/pykrait/main/docs/_static/logo.png" alt="pyKrait" width="200">
 </p>
 
-<h1 align="center">pyKrait</h1>
-
+<h1 style="text-align: center;">pyKrait</h1>
 
 <p align="center">
   <a href="https://pypi.org/project/pykrait/"><img src="https://img.shields.io/pypi/v/pykrait" alt="PyPI"></a>
   <a href="https://pypi.org/project/pykrait/"><img src="https://img.shields.io/pypi/pyversions/pykrait" alt="Python versions"></a>
-  <a href="https://github.com/&lt;your-org&gt;/pykrait/actions"><img src="https://img.shields.io/github/actions/workflow/status/&lt;your-org&gt;/pykrait/CI.yaml" alt="CI"></a>
+  <a href="https://github.com/Winklerlab-HD/pykrait/actions"><img src="https://img.shields.io/github/actions/workflow/status/Winklerlab-HD/pykrait/CI.yaml" alt="CI"></a>
     <a href="https://pykrait.readthedocs.io"><img src="https://img.shields.io/readthedocs/pykrait" alt="Docs"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-green" alt="License"></a>
 </p>
@@ -20,16 +19,23 @@
 
 
 <p align="center">
-  <img src="docs/_static/pyKrait_steps.png" alt="Analysis Steps of the pykrait package" width="600">
+  <img src="https://raw.githubusercontent.com/Winklerlab-HD/pykrait/main/docs/_static/pyKrait_steps.png" alt="Analysis Steps of the pykrait package" width="600">
 </p>
 
 ## Overview
-
 pyKrait (**py**thon **C**alcium **r**ecording **a**nalysis and **i**nterpretation **t**oolbox) automatically processes calcium-imaging videos (.czi, .tif, .tiff) and computes calcium activity, peak statistics, periodicity scores, and neighbour-aware synchronicity z-scores.
 
 ## Installation
 
 It is recommended to install pyKrait in a virtual environment using either venv or uv. The graphical user interface is optional, install it with `pip install "pykrait[gui]"`. 
+
+### Using `uv`
+
+```bash
+uv venv --python 3.12
+source .venv/bin/activate           # Windows: .venv\Scripts\activate
+uv pip install 'pykrait[gui]'
+```
 
 ### Standard `venv`
 
@@ -40,13 +46,6 @@ pip install --upgrade pip
 pip install pykrait
 ```
 
-### Using `uv`
-
-```bash
-uv venv --python 3.11
-source .venv/bin/activate           # Windows: .venv\Scripts\activate
-uv pip install pykrait
-```
 
 ## Quickstart
 
@@ -56,8 +55,11 @@ From inside the activated virtual environment:
 ```bash
 python -m pykrait
 ```
-
-The GUI walks you through video selection, segmentation, peak detection, periodicity, and synchronicity, and lets you save results to disk.
+or
+```bash
+uv run python -m pykrait
+```
+The GUI then walks you through video selection, segmentation, peak detection, periodicity, and synchronicity, and lets you save results to disk.
 
 ### Batch process an entire folder
 
@@ -77,12 +79,12 @@ concat_analysis_files("/path/to/videos", filetype="output")
 
 This produces one `Analysis_<video>/` directory per video and an `analysis_output_overview.csv` at the root of the folder.
 
-## Examples
+## Example Notebooks
 
 | Scenario | Notebook |
 |----------|----------|
-| Run a folder with custom parameters | [`notebooks/example_batch_with_custom_parameters.ipynb`](notebooks/example_batch_with_custom_parameters.ipynb) |
-| Re-run a folder reusing saved parameters and cached masks | [`notebooks/example_batch_reusing_parameters.ipynb`](notebooks/example_batch_reusing_parameters.ipynb) |
+| Run a folder with custom parameters | [notebooks/example_batch_with_custom_parameters](https://github.com/Winklerlab-HD/pykrait/blob/main/notebooks/example_batch_with_custom_parameters.ipynb) |
+| Re-run a folder reusing saved parameters and cached masks | [notebooks/example_batch_reusing_parameters](https://github.com/Winklerlab-HD/pykrait/blob/main/notebooks/example_batch_reusing_parameters.ipynb) |
 | Inspect or refine a single video interactively | Launch the GUI: `python -m pykrait` |
 
 ## How it works
@@ -102,6 +104,10 @@ For each video, pyKrait runs the following stages:
 ## Documentation
 
 Full API reference and tutorials: **<https://pykrait.readthedocs.io/en/latest/>**.
+
+## Citation
+
+If you use pyKrait, please cite the [preprint](https://www.biorxiv.org/content/10.64898/2026.05.10.723715v1): Hebach, N. R., Olshausen, N., Schlag, J., Mayer, C. D., Henkenjohann, J., Kraft, T., Bang, S., Thommek, C., Nürnberg, C., Horsak, N. E., Hoffmann, D. C., Kourtesakis, A., Porzberg, N., Flores Valle, A., Linke, C. Z., Yang, Y., Azorín, D. D., Hausmann, D., Venkataramani, V., … Karreman, M. A. (2026). Collective cancer cell calcium activity drives brain metastasis. bioRxiv, 2026.05.10.723715. https://doi.org/10.64898/2026.05.10.723715
 
 ## Acknowledgements
 

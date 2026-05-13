@@ -4,13 +4,37 @@ pykrait.trace\_analysis package
 Submodules
 ----------
 
-.. toctree::
-   :maxdepth: 4
+pykrait.trace\_analysis.filtering module
+----------------------------------------
 
-   pykrait.trace_analysis.filtering
-   pykrait.trace_analysis.oscillations
-   pykrait.trace_analysis.peak_analysis
-   pykrait.trace_analysis.synchronicity
+.. automodule:: pykrait.trace_analysis.filtering
+   :members:
+   :show-inheritance:
+   :undoc-members:
+
+pykrait.trace\_analysis.oscillations module
+-------------------------------------------
+
+.. automodule:: pykrait.trace_analysis.oscillations
+   :members:
+   :show-inheritance:
+   :undoc-members:
+
+pykrait.trace\_analysis.peak\_analysis module
+---------------------------------------------
+
+.. automodule:: pykrait.trace_analysis.peak_analysis
+   :members:
+   :show-inheritance:
+   :undoc-members:
+
+pykrait.trace\_analysis.synchronicity module
+--------------------------------------------
+
+.. automodule:: pykrait.trace_analysis.synchronicity
+   :members:
+   :show-inheritance:
+   :undoc-members:
 
 Module contents
 ---------------
