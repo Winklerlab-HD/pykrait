@@ -1,7 +1,11 @@
 import numpy as np
+import warnings
 from math import pi
 from scipy.signal import fftconvolve
 from scipy.ndimage import gaussian_filter1d
+
+# the sinc filter kernel needs an even window of at least 2 frames within the trace
+MIN_FRAMES = 3
 
 
 def _blackman_sinc_filter_kernel(kernel_window: int, cutoff_freq: float) -> list[float]:
@@ -37,6 +41,40 @@ def _blackman_sinc_filter_kernel(kernel_window: int, cutoff_freq: float) -> list
 
     kernel /= np.sum(kernel)
     return kernel
+
+
+def _interpolate_nans(signals: np.ndarray) -> np.ndarray:
+    """Linearly interpolates NaN values along the time axis of each ROI. NaNs at the start or end of a trace
+    are filled with the first or last valid value, ROIs that only contain NaNs are left untouched.
+
+    :param signals: 2D numpy array of shape (T x n_rois)
+    :type signals: np.ndarray
+    :return: 2D numpy array of shape (T x n_rois) with interpolated NaN values
+    :rtype: np.ndarray
+    """
+    nan_mask = np.isnan(signals)
+    if not nan_mask.any():
+        return signals
+
+    interpolated = np.array(signals, dtype=float, copy=True)
+    timepoints = np.arange(signals.shape[0])
+    n_interpolated_rois = 0
+    for roi in np.flatnonzero(nan_mask.any(axis=0)):
+        valid = ~nan_mask[:, roi]
+        # nothing to interpolate from
+        if not valid.any():
+            continue
+        interpolated[~valid, roi] = np.interp(
+            timepoints[~valid], timepoints[valid], signals[valid, roi]
+        )
+        n_interpolated_rois += 1
+
+    if n_interpolated_rois > 0:
+        warnings.warn(
+            f"Linearly interpolated NaN values in {n_interpolated_rois} ROI(s) before filtering.",
+            UserWarning,
+        )
+    return interpolated
 
 
 def _convolve_signals_with_kernel(
@@ -81,6 +119,7 @@ def detrend_with_sinc_filter(
     signals: np.ndarray, cutoff_period: float, sampling_interval: float
 ) -> np.ndarray:
     """Applies a Blackman-windowd sinc filter to a 2D array of signals to detrend them. Frequencies lower than the cutoff frequency will be blocked, while higher frequencies will pass through unaffected.
+    NaN values within a ROI are linearly interpolated before filtering (with a warning), ROIs containing only NaNs stay NaN.
 
     See the pyBOAT paper (https://www.biorxiv.org/content/10.1101/2020.04.29.067744v2) and Chapter 16 of the The Scientist and Engineer's Guide to Digital Signal Processing (https://www.dspguide.com/ch16/1.htm) for more details.
 
@@ -90,9 +129,25 @@ def detrend_with_sinc_filter(
     :type cutoff_period: float
     :param sampling_interval: sampling interval in [time units] of the signals
     :type sampling_interval: float
+    :raises ValueError: raises a ValueError if the cutoff period is not positive, there are no ROIs or fewer than MIN_FRAMES frames
     :return: returns the detrended signals as a 2D numpy array of shape (T x n_rois)
     :rtype: np.ndarray
     """
+    if cutoff_period <= 0:
+        raise ValueError(f"cutoff_period must be positive, got {cutoff_period}")
+    signals = np.asarray(signals)
+    if signals.ndim != 2 or signals.shape[1] == 0:
+        raise ValueError(
+            f"Expected the traces as a (frames x ROIs) array with at least one ROI, got shape {signals.shape}. Were any cells found?"
+        )
+    if signals.shape[0] < MIN_FRAMES:
+        raise ValueError(
+            f"The traces have only {signals.shape[0]} frame(s), but detrending needs at least {MIN_FRAMES}."
+        )
+
+    # a single NaN would spread across the whole trace in the convolution, so they are interpolated first
+    signals = _interpolate_nans(signals)
+
     signal_length, _ = signals.shape
 
     kernel_window = signal_length - 1

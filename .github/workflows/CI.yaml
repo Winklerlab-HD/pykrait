@@ -9,6 +9,11 @@ on:
   pull_request:
   push:
     branches: [ main, develop ]
+  # catches breaking upstream releases (e.g. bioio-czi 4 removing use_aicspylibczi)
+  # even in weeks without commits
+  schedule:
+    - cron: "0 6 * * 1"
+  workflow_dispatch:
 
 concurrency:
   group: ci-${{ github.ref }}
@@ -31,20 +36,28 @@ jobs:
       - name: Install Ruff
         run: pip install ruff
 
+      - name: Check for errors with Ruff
+        run: ruff check --select F src tests
+
       - name: Check formatting with Ruff
-        run: |
-          if ! ruff format --check src; then
-            echo "::warning::Code is not formatted correctly. Run 'ruff format src' locally."
-          fi
+        run: ruff format --check src tests
 
   tests:
-    name: Python ${{ matrix.python }} • ${{ matrix.os }}
+    name: Python ${{ matrix.python }} • ${{ matrix.os }}${{ matrix.resolution == 'lowest-direct' && ' • lowest versions' || '' }}
     runs-on: ${{ matrix.os }}
+    env:
+      QT_QPA_PLATFORM: offscreen
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
         python: ["3.11", "3.12", "3.13"]
+        resolution: [highest]
+        include:
+          # the lower bounds in pyproject.toml are only meaningful if they are tested
+          - os: ubuntu-latest
+            python: "3.11"
+            resolution: lowest-direct
 
     steps:
       # based on https://github.com/actions/runner-images/issues/2840#issuecomment-790492173
@@ -64,17 +77,26 @@ jobs:
           python-version: ${{ matrix.python }}
           cache: pip
 
-      - name: Install dependencies
+      - name: Install Qt system libraries
+        if: runner.os == 'Linux'
         run: |
-          python -m pip install --upgrade pip
-          pip install .[dev]
+          sudo apt-get update
+          sudo apt-get install -y libegl1 libgl1 libxkbcommon0 libfontconfig1 libdbus-1-3
+
+      - name: Install dependencies
+        shell: bash
+        run: |
+          python -m pip install --upgrade pip uv
+          # the GUI extra is installed as well, so the GUI tests run
+          uv pip install --system --resolution ${{ matrix.resolution }} ".[gui,dev]"
           # Add plugin for inline failure annotations
-          pip install pytest-github-actions-annotate-failures
+          uv pip install --system pytest-github-actions-annotate-failures
 
       - name: Show versions
         run: |
           python -V
           pip -V
+          pip list
 
       - name: Run tests
         shell: bash
@@ -87,20 +109,20 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: reports-${{ matrix.os }}-py${{ matrix.python }}
+          name: reports-${{ matrix.os }}-py${{ matrix.python }}-${{ matrix.resolution }}
           path: reports/
 
       - name: Upload coverage to Codecov
-        if: matrix.os == 'ubuntu-latest' && matrix.python == '3.11'
-        uses: codecov/codecov-action@v4
+        if: matrix.os == 'ubuntu-latest' && matrix.python == '3.11' && matrix.resolution == 'highest'
+        uses: codecov/codecov-action@v5
         with:
           files: reports/coverage.xml
           token: ${{ secrets.CODECOV_TOKEN }}
           
       - name: Report test results
         if: always()
-        uses: dorny/test-reporter@v1
+        uses: dorny/test-reporter@v2
         with:
-          name: pytest results (${{ matrix.os }} py${{ matrix.python }})
+          name: pytest results (${{ matrix.os }} py${{ matrix.python }} ${{ matrix.resolution }})
           path: reports/junit.xml
           reporter: java-junit

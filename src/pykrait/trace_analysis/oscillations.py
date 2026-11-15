@@ -38,30 +38,44 @@ def calculate_std_cov(
 
 
 def get_random_std_covs(
-    filtered_peak_series: np.ndarray, frame_interval: float, n_iter: int = 100
+    filtered_peak_series: np.ndarray,
+    frame_interval: float,
+    n_iter: int = 100,
+    rng: np.random.Generator = None,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """
     randomly shuffles the peak series across the time axis (individually per ROI) and returns n_iter times the random standard deviations and coefficients of variation.
 
     :param filtered_peak_series: (T x n_roi) binary array with 1s at the peak locations and 0s elsewhere, where n_roi are ROIs with at least 4 peaks
     :type filtered_peak_series: np.ndarray
-    :param n_iter: number of iterations for random control
-    :type n_iter: 100
     :param frame_interval: frame interval of the recording in seconds
     :type frame_interval: float
-    :return: returns the standard deviation and coefficient of variation thresholds for the random control data
+    :param n_iter: number of iterations for random control, defaults to 100
+    :type n_iter: int, optional
+    :param rng: random number generator used for shuffling, defaults to a generator seeded from the global np.random state
+    :type rng: np.random.Generator, optional
+    :return: returns the standard deviations and coefficients of variation of the random control data, of length n_roi * n_iter (ordered by iteration, then ROI)
     :rtype: Tuple[np.ndarray, np.ndarray]
     """
-    # for the random control, generate a stacked peak series
-    stacked_peak_series = np.hstack([filtered_peak_series] * n_iter)
+    if rng is None:
+        # seeded from the global state, so np.random.seed still makes results reproducible
+        rng = np.random.default_rng(np.random.randint(0, 2**32, dtype=np.uint64))
 
-    # shuffle each column independently
-    T, n = stacked_peak_series.shape
-    idx = np.argsort(np.random.rand(T, n), axis=0)
-    stacked_peak_series = np.take_along_axis(stacked_peak_series, idx, axis=0)
+    # only the peak positions matter, a compact boolean copy keeps the shuffling cheap
+    compact_peak_series = np.asarray(filtered_peak_series) != 0
 
-    # calculate std and cv for each column
-    return calculate_std_cov(stacked_peak_series, frame_interval)
+    random_stds = []
+    random_covs = []
+    for _ in range(n_iter):
+        # shuffle each column independently along the time axis
+        shuffled_peak_series = rng.permuted(compact_peak_series, axis=0)
+        stds, covs = calculate_std_cov(shuffled_peak_series, frame_interval)
+        random_stds.append(stds)
+        random_covs.append(covs)
+
+    if n_iter == 0:
+        return np.array([]), np.array([])
+    return np.concatenate(random_stds), np.concatenate(random_covs)
 
 
 def find_oscillating_rois(
@@ -81,7 +95,7 @@ def find_oscillating_rois(
     :type peak_series: np.ndarray
     :param std_threshold: threshold for standard deviation (can be both a cutoff or a quantile depending on the periodicity_method)
     :type std_threshold: float
-    :param cov_threshold: threshold for standard deviation (can be both a cutoff or a quantile depending on the periodicity_method)
+    :param cov_threshold: threshold for coefficient of variation (can be both a cutoff or a quantile depending on the periodicity_method)
     :type cov_threshold: float
     :param frame_interval: frame interval of the recording in seconds
     :type frame_interval: float
@@ -90,9 +104,6 @@ def find_oscillating_rois(
     :return: returns a dictionary with the periodicity results, and the standard deviations and coefficients of variation for the experimental data
     :rtype: Tuple[dict, np.ndarray, np.ndarray]
     """
-    if not (0 <= cov_threshold <= 1):
-        raise ValueError("cov_threshold must be between 0 and 1.")
-
     if periodicity_method == "cutoff":
         std_cutoff = std_threshold
         cov_cutoff = cov_threshold
@@ -112,8 +123,11 @@ def find_oscillating_rois(
         cov_quantile = percentileofscore(random_covs_for_quantile, cov_threshold) / 100
 
     elif periodicity_method == "quantile":
+        # quantiles have to be between 0 and 1, cutoffs can take any value
         if not (0 <= std_threshold <= 1):
             raise ValueError("std_threshold must be between 0 and 1.")
+        if not (0 <= cov_threshold <= 1):
+            raise ValueError("cov_threshold must be between 0 and 1.")
 
         std_quantile = std_threshold
         cov_quantile = cov_threshold
@@ -155,7 +169,8 @@ def find_oscillating_rois(
 
     return periodicity_results, experimental_stds, experimental_covs
 
-def _flatten_list(nested_list:List[List]) -> list:
+
+def _flatten_list(nested_list: List[List]) -> list:
     """
     flattens a nested list
 
@@ -163,10 +178,13 @@ def _flatten_list(nested_list:List[List]) -> list:
     :type nested_list: _type_
     :return: returns the flattened list
     :rtype: list
-    """    
+    """
     return [x for xs in nested_list for x in xs]
 
-def find_median_frequency(peak_series: np.ndarray, frame_interval: float) -> Tuple[float, float, np.ndarray]:
+
+def find_median_frequency(
+    peak_series: np.ndarray, frame_interval: float
+) -> Tuple[float, float, np.ndarray]:
     """
     returns the median overall frequency across all peak-peak intervals, and the median frequencies of active cells (calculated as median of the median peak-peak intervals of each cell)
 
@@ -177,15 +195,30 @@ def find_median_frequency(peak_series: np.ndarray, frame_interval: float) -> Tup
     :type frame_interval: float
     :return: returns the overall median frequency and the median of the cell median frequencies in mHz, as well as the array of median periods for each cell
     :rtype: Tuple[float, float, np.ndarray]
-    """ 
+    """
     peak_indices = [np.flatnonzero(col) for col in peak_series.T]
     peak_diff = [np.diff(indices) * frame_interval for indices in peak_indices]
     flattened_diffs = _flatten_list(peak_diff)
-    total_median_frequency_mHz = 1000/(np.nanmedian(flattened_diffs)) if len(flattened_diffs) > 0 else np.nan
+    total_median_frequency_mHz = (
+        1000 / (np.nanmedian(flattened_diffs)) if len(flattened_diffs) > 0 else np.nan
+    )
 
-    active_cell_periods = [
-        np.nanmedian(cell_diffs) if cell_diffs is not None and len(cell_diffs) >= 3 else np.nan
-        for cell_diffs in peak_diff
-    ]
-    active_cells_median_frequency_mHz = 1000/np.nanmedian(active_cell_periods) if len(active_cell_periods) > 0 else np.nan
-    return total_median_frequency_mHz, active_cells_median_frequency_mHz, active_cell_periods
+    # median period of every cell with at least 3 peak-peak intervals, NaN otherwise
+    active_cell_periods = np.array(
+        [
+            np.nanmedian(cell_diffs) if len(cell_diffs) >= 3 else np.nan
+            for cell_diffs in peak_diff
+        ],
+        dtype=float,
+    )
+
+    # without any active cell there is no median frequency (and nanmedian would warn about an all-NaN slice)
+    if np.any(~np.isnan(active_cell_periods)):
+        active_cells_median_frequency_mHz = 1000 / np.nanmedian(active_cell_periods)
+    else:
+        active_cells_median_frequency_mHz = np.nan
+    return (
+        total_median_frequency_mHz,
+        active_cells_median_frequency_mHz,
+        active_cell_periods,
+    )

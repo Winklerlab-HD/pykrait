@@ -57,3 +57,7 @@ docs/Makefile
 
 # cellpose models
 cellpose_models/
+notebooks/batch_notebook.ipynb
+
+# local notebooks, may contain real data paths and executed outputs
+notebooks/local_*.ipynb

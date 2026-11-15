@@ -2,128 +2,57 @@ import numpy as np
 import pandas as pd
 import warnings
 import dask.array as da
-from dask import delayed, compute
-from tqdm.dask import TqdmCallback
-from functools import lru_cache
-from skimage.measure import regionprops_table, regionprops
+from tqdm import tqdm
+
+from pykrait.io.frame_cache import iter_frame_blocks
+from skimage.measure import regionprops_table
 from skimage.segmentation import find_boundaries
 from skimage.morphology import disk
-from scipy.spatial.distance import cdist
-from scipy.ndimage import binary_erosion, label
-from scipy.sparse.csgraph import floyd_warshall
-from scipy.spatial import KDTree
-from scipy.sparse import lil_matrix
+from scipy.ndimage import binary_erosion, distance_transform_edt, label, find_objects
+from scipy.sparse.csgraph import shortest_path
 
-def _legacy_extract_mean_intensities(
-    numpy_timelapse: np.ndarray, masks: np.ndarray
-) -> np.ndarray:
-    """
-    This function computes the mean intensity of each cell across all frames in a timelapse, given a label image that identifies
-    the regions. It returns a 2D numpy array where each row corresponds to a cell and each column corresponds to a frame, containing the
-    mean intensity of each cell per frame.
-
-    Note: If the input timelapse has multiple channels, only the first channel (C=0) will be used for intensity calculations.
-
-    It expectes the 4D-numpy array with order "TCYX" to be fully loaded into memory. Loading the dataframe into memory and running this function takes more memory and longer than the lazy version.
-
-    :param numpy_timelapse: A 4D-numpy array with order "TCYX", fully loaded into memory.
-    :type numpy_timelapse: np.ndarray
-    :param masks: A 2D numpy array containing labels for each region as label image.
-    :type masks: np.ndarray
-
-    :return: a cell x time numpy ndarray containing the mean intensity of each cell per frame of shape (n_cells, T).
-    :rtype: np.ndarray
-    """
-    if not isinstance(numpy_timelapse, np.ndarray):
-        raise TypeError("Input must be a numpy array.")
-    if numpy_timelapse.ndim != 4:
-        raise ValueError("Input timelapse must be a 4D array with shape TCYX.")
-    if masks.ndim != 2:
-        raise ValueError("Masks must be a 2D array representing the label image.")
-    if (
-        masks.shape[0] != numpy_timelapse.shape[2]
-        or masks.shape[1] != numpy_timelapse.shape[3]
-    ):
-        raise ValueError(
-            "Masks shape (Y,X: {}, {}) must match the spatial dimensions of the timelapse (Y,X: {}, {}).".format(
-                masks.shape[0],
-                masks.shape[1],
-                numpy_timelapse.shape[2],
-                numpy_timelapse.shape[3],
-            )
-        )
-
-    # check that the timelapse is in TCYX order
-    T, C, Y, X = numpy_timelapse.shape
-    if T < C or T > Y or T > X or C > Y or C > X:
-        warnings.warn(
-            f"Input array shape of {numpy_timelapse.shape} is unusual. Is it in TCYX order?",
-            UserWarning,
-        )
-    if C > 1:
-        warnings.warn(
-            "Input timelapse has multiple channels. Only the first channel (C=0) will be used for intensity calculations.",
-            UserWarning,
-        )
-
-    video = numpy_timelapse[:, 0, :, :].squeeze()  # Ensure it's 3D (T, Y, X)
-
-    roi_properties = regionprops_table(
-        label_image=masks,
-        intensity_image=video.transpose(1, 2, 0),
-        properties=("label", "intensity_mean"),
-        separator=",",
-    )
-    intensity_array = np.array(list(roi_properties.values())[1:])
-
-    return intensity_array
-
-
-def _compute_mean_for_frame(frame: np.ndarray, masks: np.array) -> np.ndarray:
-    """Helper function to compute the mean intensity of each cell for a single frame.
-    It uses regionprops_table from skimage.measure to compute the mean intensities.
-
-    :param frame: A 4D dask array with order "TCYX", fully loaded into memory.
-    :type frame: np.ndarray
-    :param masks: The label image for the frame.
-    :type masks: np.ndarray
-
-    :return: a numpy array containing the mean intensity of each cell for the specified timepoint.
-    :rtype: np.ndarray
-    """
-    props = regionprops_table(
-        label_image=masks, intensity_image=frame, properties=("label", "intensity_mean")
-    )
-    return np.array(props["intensity_mean"])
 
 def shrink_masks(masks: np.ndarray, shrink_factor: float = 0.7) -> np.ndarray:
     """
     returns a label image with labels shrunk concentrically by a factor
 
-    :param masks: label image of size m x n 
+    :param masks: label image of size m x n
     :type label_img: np.ndarray
     :param shrink_factor: factor to shrink label by, defaults to 0.7
     :type shrink_factor: float, optional
     :return: returns the shrunk label image
     :rtype: np.ndarray
-    """    
+    """
     shrunk_img = np.zeros_like(masks)
-    roi_labels = np.unique(masks)
-    roi_labels = roi_labels[roi_labels != 0]  # skip background
 
     # 8-way connectivity in 2D
     kernel = np.ones((3, 3), dtype=bool)
 
-    for label_val in roi_labels:
-        roi_mask = masks == label_val
+    # every ROI is eroded inside its own bounding box instead of on the full image
+    bounding_boxes = find_objects(masks)
+
+    for index, bounding_box in enumerate(bounding_boxes):
+        if bounding_box is None:  # label not present in the image
+            continue
+        label_val = index + 1
+
+        # pad the box so the erosion sees the background around the ROI
+        bounding_box = tuple(
+            slice(max(axis.start - 1, 0), min(axis.stop + 1, masks.shape[dimension]))
+            for dimension, axis in enumerate(bounding_box)
+        )
+        roi_mask = masks[bounding_box] == label_val
+        target = shrunk_img[bounding_box]
 
         # Compute erosion iterations based on area ratio
         area_original = roi_mask.sum()
         area_target = area_original * shrink_factor
 
         if area_target < 20:
-            warnings.warn(f"ROI {label_val} too small to shrink — keeping original.", UserWarning)
-            shrunk_img[roi_mask] = label_val
+            warnings.warn(
+                f"ROI {label_val} too small to shrink — keeping original.", UserWarning
+            )
+            target[roi_mask] = label_val
             continue
         radius_original = int(np.sqrt(area_original / np.pi))
         radius_target = int(np.sqrt(area_target / np.pi))
@@ -132,28 +61,39 @@ def shrink_masks(masks: np.ndarray, shrink_factor: float = 0.7) -> np.ndarray:
         eroded_mask = binary_erosion(roi_mask, structure=disk(1), iterations=iterations)
 
         labeled, n = label(eroded_mask, structure=kernel)
-        if n > 1:
-                component_sizes = np.bincount(labeled.ravel())[1:]
-                largest_idx = np.argmax(component_sizes) + 1
-                shrunk_img[labeled == largest_idx] = label_val
+        if n == 0:
+            # erosion removed the whole ROI, so it is kept unshrunk instead of being lost
+            warnings.warn(
+                f"ROI {label_val} vanished when shrinking — keeping original.",
+                UserWarning,
+            )
+            target[roi_mask] = label_val
+        elif n > 1:
+            component_sizes = np.bincount(labeled.ravel())[1:]
+            largest_idx = np.argmax(component_sizes) + 1
+            target[labeled == largest_idx] = label_val
 
-                warnings.warn(
-                    f"ROI {label_val} had {n} disconnected components — kept the largest ({component_sizes[largest_idx-1]} px).",
-                    UserWarning,
-                )
+            warnings.warn(
+                f"ROI {label_val} had {n} disconnected components — kept the largest ({component_sizes[largest_idx - 1]} px).",
+                UserWarning,
+            )
         else:
-            shrunk_img[eroded_mask] = label_val
+            target[eroded_mask] = label_val
 
     return shrunk_img
 
+
 def extract_mean_intensities(
-    dask_timelapse: da.Array, masks: np.ndarray, verbose: bool = True, channel_index: int = 0
+    dask_timelapse: da.Array,
+    masks: np.ndarray,
+    verbose: bool = True,
+    channel_index: int = 0,
 ) -> np.ndarray:
     """
     This function computes the mean intensity of each cell across all frames in a timelapse, given a label image that identifies
     the regions.
 
-    Note: If the input timelapse has multiple channels, only the first channel (C=0) will be used for intensity calculations.
+    Note: If the input timelapse has multiple channels, only the channel at `channel_index` is used for intensity calculations.
     It uses dask to lazily compute the mean intensities for each ROI and timepoint and does not load the entire timelapse into memory.
 
     :param dask_timelapse: A 4D dask array with order "TCYX", fully loaded into memory.
@@ -178,8 +118,9 @@ def extract_mean_intensities(
         )
     if masks.ndim != 2:
         raise ValueError(
-            "Masks must be a 2D array representing the label image and not shape {}.",
-            format(masks.shape),
+            "Masks must be a 2D array representing the label image and not shape {}.".format(
+                masks.shape
+            )
         )
     if (
         masks.shape[0] != dask_timelapse.shape[2]
@@ -210,32 +151,45 @@ def extract_mean_intensities(
             UserWarning,
         )
 
-    dask_timelapse = dask_timelapse.rechunk({0: 1, 1: 1})
-    n_rois = np.max(masks)
-
     shrunk_masks = shrink_masks(masks, shrink_factor=0.7)
 
-    dask_frames = dask_timelapse[:, channel_index, :, :]  # shape: (T, Y, X)
+    # Pixels are grouped by label once, so that the mean of every ROI is a single
+    # bincount per frame instead of a full regionprops pass over the label image.
+    # Column i always belongs to label i + 1, as the adjacency matrix and the cell
+    # properties index ROIs the same way. Labels missing from the masks get NaN columns.
+    n_rois = int(masks.max())
+    flat_labels = shrunk_masks.ravel()
+    pixels_per_label = np.bincount(flat_labels, minlength=n_rois + 1)
+    present_labels = np.flatnonzero(pixels_per_label[1:]) + 1  # skip the background
+    pixel_counts = pixels_per_label[present_labels]
+    if len(present_labels) < n_rois:
+        missing = sorted(set(range(1, n_rois + 1)) - set(present_labels.tolist()))
+        warnings.warn(
+            f"Labels {missing} do not exist in the masks, their intensities are NaN. Relabel the masks to consecutive labels to avoid empty ROIs.",
+            UserWarning,
+        )
 
-    def block_func(block):  # block has shape (1, Y, X)
-        frame = block[0]  # shape (Y, X)
-        means = _compute_mean_for_frame(frame, shrunk_masks)  # shape (n_rois,)
-        return means[np.newaxis, :]  # shape (1, n_rois)
+    # the timelapse is streamed in blocks, so it is read once and never held in memory
+    frame_bytes = np.dtype(dask_timelapse.dtype).itemsize * Y * X
+    block_size = max(1, int(256 * 1024**2 // max(frame_bytes, 1)))
 
-    mean_dask = da.map_blocks(
-        block_func,
-        dask_frames,
-        dtype=np.float32,
-        chunks=(1, n_rois),  # Must match output shape per block
-        drop_axis=(1, 2),  # Drop Y, X axes
-        new_axis=1,  # Add n_rois axis
-    )
-
-    if verbose:
-        with TqdmCallback(desc="Computing mean intensities"):
-            mean_intensities = mean_dask.compute(scheduler="threads")
-    else:
-        mean_intensities = mean_dask.compute(scheduler="threads")
+    mean_intensities = np.full((T, n_rois), np.nan, dtype=np.float64)
+    with tqdm(
+        total=T, desc="Computing mean intensities", disable=not verbose
+    ) as progress:
+        for start, block in iter_frame_blocks(
+            dask_timelapse[:, channel_index], block_size
+        ):
+            for offset, frame in enumerate(block):
+                sums = np.bincount(
+                    flat_labels,
+                    weights=frame.ravel(),
+                    minlength=len(pixels_per_label),
+                )[present_labels]
+                mean_intensities[start + offset, present_labels - 1] = (
+                    sums / pixel_counts
+                )
+            progress.update(block.shape[0])
 
     return mean_intensities  # shape: (T, n_rois)
 
@@ -285,117 +239,39 @@ def extract_cell_properties(masks: np.ndarray) -> tuple:
     return cell_properties, cell_positions
 
 
-def _legacy_get_adjacency_matrix(
-    masks: np.ndarray, neighbour_tolerance: int
-) -> tuple[np.ndarray, np.ndarray]:
-    """Computes the adjacency matrix and shortest path matrix for the given mask with ROIs using pairwise distances between all boundary pixels.
+def _find_neighbours_of_region(
+    masks: np.ndarray, label_val: int, bounding_box: tuple, neighbour_tolerance: int
+) -> np.ndarray:
+    """Helper function to find the labels of all ROIs within neighbour_tolerance pixels of the outer boundary of a ROI
 
-    :param masks: masks of the cell ROIs as label image
-    :type masks: np.ndarray
-    :param neighbour_tolerance: maximum distance between two ROIs to still be considered neighbours, in pixels.
-    :type neighbour_tolerance: int
-    :return: _description_
-    :rtype: tuple[np.ndarray, np.ndarray]
-    """
-    n_labels = masks.max()
-    adjacency_matrix = np.zeros((n_labels, n_labels), dtype=np.uint8)
+    The ROI is only processed inside its bounding box, padded by the tolerance and the
+    one pixel wide outer boundary, which contains every pixel within reach.
 
-    props = regionprops(masks)
-    all_boundary_pixels = []
-    pixel_labels = []
-
-    for region in props:
-        label = region.label
-        region_mask = masks == label
-        boundary = find_boundaries(region_mask, mode="outer")
-        coords = np.argwhere(boundary)
-        all_boundary_pixels.append(coords)
-        pixel_labels.extend([label - 1] * len(coords))
-
-    if len(all_boundary_pixels) == 0:
-        shortest_path_matrix = np.triu(floyd_warshall(adjacency_matrix), k=1)
-        return adjacency_matrix, shortest_path_matrix
-
-    all_boundary_pixels = np.vstack(all_boundary_pixels)
-    pixel_labels = np.array(pixel_labels)
-
-    tree = KDTree(all_boundary_pixels)
-    pairs = tree.query_pairs(r=neighbour_tolerance)
-
-    for idx1, idx2 in pairs:
-        label1 = pixel_labels[idx1]
-        label2 = pixel_labels[idx2]
-        if label1 != label2:
-            adjacency_matrix[label1, label2] = 1
-            adjacency_matrix[label2, label1] = 1
-
-    shortest_path_matrix = np.triu(floyd_warshall(adjacency_matrix), k=1)
-    return adjacency_matrix, shortest_path_matrix
-
-
-@lru_cache(maxsize=32)
-def _generate_distance_kernel(neighbour_tolerance: int) -> np.ndarray:
-    """Generates a circular distance kernel for the given neighbour tolerance to identify pixels within bounds
-
-    :param neighbour_tolerance: integer defining the maximum distance between two pixels to be considered neighbours.
-    :type neighbour_tolerance: int
-    :return: returns a 2D numpy array of shape (2 * neighbour_tolerance + 1, 2 * neighbour_tolerance + 1) where each pixel is either 0 or 1, indicating whether the pixel is within the neighbour tolerance.
-    :rtype: np.ndarray
-    """
-    size = 2 * neighbour_tolerance + 1
-    coords = np.indices((size, size)).reshape(2, -1).T
-    center = np.array([[neighbour_tolerance, neighbour_tolerance]])
-    distances = cdist(center, coords).reshape(size, size)
-    return (distances <= neighbour_tolerance).astype(np.uint8)
-
-
-def _process_region(
-    region, masks: np.ndarray, circular_kernel: np.ndarray, kernel_radius: int
-) -> list:
-    """Helper function to process each region and find pairs of adjacent masks
-
-    :param region: region object from skimage.measure.regionprops
-    :type region: _type_
     :param masks: label image containing the ROIs for each cell
     :type masks: np.ndarray
-    :param circular_kernel: kernel used to identify pixels within the neighbour tolerance
-    :type circular_kernel: np.ndarray
-    :param kernel_radius: radius of the circular kernel, defining the maximum distance between two pixels to be considered neighbours
-    :type kernel_radius: int
-    :return: returns a list of tuples, where each tuple contains the indices of two adjacent regions (i, j) such that i < j.
-    :rtype: list
+    :param label_val: label of the ROI
+    :type label_val: int
+    :param bounding_box: bounding box of the ROI as returned by scipy.ndimage.find_objects
+    :type bounding_box: tuple
+    :param neighbour_tolerance: maximum Euclidean distance in pixels between the outer boundary and a neighbouring ROI
+    :type neighbour_tolerance: int
+    :return: returns the labels of the neighbouring ROIs, without the background and the ROI itself
+    :rtype: np.ndarray
     """
-    h, w = masks.shape
-    label = region.label
-    region_mask = masks == label
-    boundary = find_boundaries(region_mask, mode="outer")
-    ys, xs = np.argwhere(boundary).T
-
-    found_pairs = set()
-
-    for y, x in zip(ys, xs):
-        y_start = max(0, y - kernel_radius)
-        y_end = min(h, y + kernel_radius + 1)
-        x_start = max(0, x - kernel_radius)
-        x_end = min(w, x + kernel_radius + 1)
-
-        patch = masks[y_start:y_end, x_start:x_end]
-
-        ky_start = kernel_radius - (y - y_start)
-        ky_end = ky_start + (y_end - y_start)
-        kx_start = kernel_radius - (x - x_start)
-        kx_end = kx_start + (x_end - x_start)
-
-        mask_patch = circular_kernel[ky_start:ky_end, kx_start:kx_end]
-        visible_labels = np.unique(patch[mask_patch > 0])
-
-        for neighbor_label in visible_labels:
-            if neighbor_label == 0 or neighbor_label == label:
-                continue
-            i, j = label - 1, neighbor_label - 1
-            found_pairs.add((min(i, j), max(i, j)))  # Sort to avoid duplicates
-
-    return list(found_pairs)
+    padding = neighbour_tolerance + 1
+    bounding_box = tuple(
+        slice(max(axis.start - padding, 0), min(axis.stop + padding, size))
+        for axis, size in zip(bounding_box, masks.shape)
+    )
+    patch = masks[bounding_box]
+    boundary = find_boundaries(patch == label_val, mode="outer")
+    if not boundary.any():
+        return np.array([], dtype=masks.dtype)
+    # every pixel within neighbour_tolerance of any boundary pixel, the same pixels as
+    # placing a disk of that radius on every boundary pixel, independent of its size
+    within_reach = distance_transform_edt(~boundary) <= neighbour_tolerance
+    labels = np.unique(patch[within_reach])
+    return labels[(labels != 0) & (labels != label_val)]
 
 
 def get_adjacency_matrix(
@@ -412,34 +288,28 @@ def get_adjacency_matrix(
     :return: returns a ROI x ROI adjacency matrix, where the element at (i, j) is 1 if ROI i and ROI j are neighbours, and 0 otherwise. Also returns a shortest path matrix, where the element at (i, j) is the length of the shortest path between ROI i and ROI j.
     :rtype: tuple[np.ndarray, np.ndarray]
 
-    In benchmarking, this function is about 25x faster than the legacy version _legacy_get_adjacency_matrix, which uses cdist to compute the distances between all pairs of ROIs. However, they do not produce exactly the same adjacency matrix.
-    _legacy_get_adjacency_matrix identifies ca. 1.7% more pairs of adjacent ROIs than this function, which is likely due to edge cases around the kernel radius and the way boundaries are defined here.
+    Two ROIs are neighbours if a pixel of one ROI lies within neighbour_tolerance pixels of the outer boundary of the other.
+    The former legacy implementation, which computed the distances between all boundary pixels instead, identified ca. 1.7% more pairs of adjacent ROIs, likely due to edge cases around the kernel radius and the way boundaries are defined here.
     """
     n_labels = masks.max()
-    kernel_radius = neighbour_tolerance
-    circular_mask = _generate_distance_kernel(neighbour_tolerance)
+    adjacency_matrix = np.zeros((n_labels, n_labels), dtype=np.uint8)
+    for index, bounding_box in enumerate(
+        tqdm(
+            find_objects(masks), desc="Computing adjacency matrix", disable=not verbose
+        )
+    ):
+        if bounding_box is None:  # label not present in the image
+            continue
+        neighbours = (
+            _find_neighbours_of_region(
+                masks, index + 1, bounding_box, neighbour_tolerance
+            ).astype(np.intp)
+            - 1
+        )
+        adjacency_matrix[index, neighbours] = 1
+        adjacency_matrix[neighbours, index] = 1
 
-    props = regionprops(masks)
-
-    tasks = [
-        delayed(_process_region)(region, masks, circular_mask, kernel_radius)
-        for region in props
-    ]
-
-    # If verbose is True, use TqdmCallback to show progress
-    if verbose:
-        with TqdmCallback(desc="Computing adjacency matrix"):
-            region_pairs = compute(*tasks)
-    else:
-        region_pairs = compute(*tasks)
-
-    adjacency_matrix = lil_matrix((n_labels, n_labels), dtype=np.uint8)
-    for pairs in region_pairs:
-        for i, j in pairs:
-            adjacency_matrix[i, j] = 1
-            adjacency_matrix[j, i] = 1
-
-    shortest_path_matrix = floyd_warshall(
-        adjacency_matrix, directed=False, unweighted=True
+    shortest_path_matrix = shortest_path(
+        adjacency_matrix, method="D", directed=False, unweighted=True
     )
-    return adjacency_matrix.toarray(), np.triu(shortest_path_matrix, k=1)
+    return adjacency_matrix, np.triu(shortest_path_matrix, k=1)

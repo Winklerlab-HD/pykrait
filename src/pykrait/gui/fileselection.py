@@ -1,8 +1,6 @@
 import os
-import csv
 from pathlib import Path
 import yaml
-from dataclasses import fields
 
 from PySide6.QtWidgets import (
     QWidget,
@@ -21,11 +19,59 @@ from PySide6.QtWidgets import (
     QStackedWidget,
     QSizePolicy,
     QLayout,
+    QComboBox,
+    QSpinBox,
+    QDoubleSpinBox,
+    QFormLayout,
 )
-from PySide6.QtCore import Qt, QThread, Signal
+from PySide6.QtCore import Qt, Signal
 from pykrait.pipeline.pipeline import AnalysisParameters, AnalysisOutput
-from pykrait.gui.async_workers import ExtractIntensitiesWorker
-from pykrait.io.files import _auto_cast
+from pykrait.preprocessing.motion_correction import MOTION_CORRECTION_METHODS
+from pykrait.gui.async_workers import (
+    ExtractIntensitiesWorker,
+    defer_close_while_running,
+    start_worker,
+    stop_workers,
+)
+from pykrait.io.files import get_analysis_file
+
+GROUP_BOX_STYLE = "QGroupBox { font-weight: bold; font-size: 14px; }"
+
+
+def _snug_stack() -> QStackedWidget:
+    """Returns a stacked widget whose height always fits its current page."""
+    stack = QStackedWidget()
+
+    def sync_height():
+        height = stack.currentWidget().sizeHint().height()
+        stack.setMinimumHeight(height)
+        stack.setMaximumHeight(height)
+        stack.updateGeometry()
+
+    stack.currentChanged.connect(lambda _: sync_height())
+    stack.sync_height = sync_height
+    return stack
+
+
+def _settings_page(title: str):
+    """
+    Returns a page for a stacked widget holding a single group box, and the layout of
+    the group box.
+    """
+    page = QWidget()
+    page_layout = QVBoxLayout(page)
+    page_layout.setContentsMargins(0, 0, 0, 0)  # keep the page flush with the group box
+    page_layout.setSpacing(0)
+    page_layout.setSizeConstraint(QLayout.SetMinimumSize)
+
+    group = QGroupBox(title)
+    group.setStyleSheet(GROUP_BOX_STYLE)
+    group_layout = QVBoxLayout(group)
+    group_layout.setSpacing(6)
+    group.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Minimum)
+    page_layout.addWidget(group)
+    return page, group_layout
+
 
 class FileSelectionWindow(QWidget):
     analysis_complete = Signal(dict)
@@ -42,7 +88,11 @@ class FileSelectionWindow(QWidget):
         self.model_path = None
         self.label_image_path = None
         self.mean_intensities_path = None
-        self.analysis_param_path = None
+        # files found in the analysis folder of the selected video, not picked by hand
+        self._auto_detected = set()
+        # parameters and outputs loaded from a previous analysis of the selected video
+        self.analysis_params = None
+        self.output_params = None
 
         self.init_ui()
 
@@ -53,7 +103,7 @@ class FileSelectionWindow(QWidget):
 
         # --- Entry Point Selection ---
         entry_group = QGroupBox("Entry Point")
-        entry_group.setStyleSheet("QGroupBox { font-weight: bold; font-size: 14px; }")
+        entry_group.setStyleSheet(GROUP_BOX_STYLE)
         entry_group.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
         entry_layout = QHBoxLayout()
         self.model_radio = QRadioButton("Video + Cellpose Model")
@@ -69,7 +119,7 @@ class FileSelectionWindow(QWidget):
         self.main_layout.addWidget(entry_group)
 
         # --- File Selection Group ---
-        self.file_stack = QStackedWidget()
+        self.file_stack = _snug_stack()
         self.file_stack.addWidget(self.create_video_model_page())  # index 0
         self.file_stack.addWidget(self.create_video_labels_page())  # index 1
         self.file_stack.addWidget(self.create_video_labels_csv_page())  # index 2
@@ -79,53 +129,21 @@ class FileSelectionWindow(QWidget):
         self.label_radio.toggled.connect(lambda: self.file_stack.setCurrentIndex(1))
         self.label_csv_radio.toggled.connect(lambda: self.file_stack.setCurrentIndex(2))
 
-        # keep stack height snug to current page
-        def _sync_file_stack_height():
-            w = self.file_stack.currentWidget()
-            h = w.sizeHint().height()
-            self.file_stack.setMinimumHeight(h)
-            self.file_stack.setMaximumHeight(h)
-            self.file_stack.updateGeometry()
-
-        # connect after index changes
-        self.file_stack.currentChanged.connect(lambda _: _sync_file_stack_height())
-        _sync_file_stack_height()  # initial
+        self.file_stack.sync_height()
 
         self.main_layout.addWidget(self.file_stack)
 
-        # --- Analysis Parameter Load Button ---
+        # --- Analysis Parameter Status ---
+        # greyed out, it only shows the file the parameters were inferred from
         self.load_param_button = QPushButton("Load Analysis Parameters")
-        self.load_param_button.clicked.connect(self.load_analysis_parameters)
-        self.load_param_button.setEnabled(False)  # Start greyed out
+        self.load_param_button.setEnabled(False)
         self.main_layout.addWidget(self.load_param_button)
 
         # --- Analysis Settings Group ---
-        self.analysis_stack = QStackedWidget()
-        self.analysis_stack.addWidget(self.create_analysis_settings_model())  # index 0
-        self.analysis_stack.addWidget(self.create_analysis_settings_other())  # index 1
+        self.main_layout.addWidget(self.create_analysis_settings())
 
-        # Connect radio buttons to change stack
-        self.model_radio.toggled.connect(lambda: self.analysis_stack.setCurrentIndex(0))
-        self.label_radio.toggled.connect(lambda: self.analysis_stack.setCurrentIndex(1))
-        self.label_csv_radio.toggled.connect(
-            lambda: self.analysis_stack.setCurrentIndex(1)
-        )
-
-        # keep stack height snug to current page
-        def _sync_analysis_stack_height():
-            w = self.analysis_stack.currentWidget()
-            h = w.sizeHint().height()
-            self.analysis_stack.setMinimumHeight(h)
-            self.analysis_stack.setMaximumHeight(h)
-            self.analysis_stack.updateGeometry()
-
-        # connect after index changes
-        self.analysis_stack.currentChanged.connect(
-            lambda _: _sync_analysis_stack_height()
-        )
-        _sync_analysis_stack_height()  # initial
-
-        self.main_layout.addWidget(self.analysis_stack)
+        # --- Motion Correction Settings ---
+        self.main_layout.addWidget(self.create_motion_correction_group())
 
         # --- Confirm Button & Progress Bar ---
         confirm_layout = QVBoxLayout()
@@ -177,132 +195,53 @@ class FileSelectionWindow(QWidget):
         self.save_settings()
 
     # ---------- FILE SELECTION LAYOUT ----------
-    def create_video_model_page(self) -> QWidget:
-        page = QWidget()
-        page_layout = QVBoxLayout(page)
-        page_layout.setContentsMargins(
-            0, 0, 0, 0
-        )  # keep the page flush with the group box
-        page_layout.setSpacing(0)
-        page_layout.setSizeConstraint(QLayout.SetMinimumSize)
+    def _file_page(self, rows) -> QWidget:
+        """
+        Builds a file selection page with a browse button and a label for every file.
 
-        group = QGroupBox("File Selection")
-        group.setStyleSheet("QGroupBox { font-weight: bold; font-size: 14px; }")
-        g_layout = QVBoxLayout(group)
-        g_layout.setSpacing(6)
-        group.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Minimum)
-
-        # Video
-        self.btn_video_vm = QPushButton("Browse Video")
-        self.lbl_video_vm = QLabel("No file selected")
-        self.lbl_video_vm.setWordWrap(True)
-        self.btn_video_vm.clicked.connect(
-            lambda: self.select_image(label=self.lbl_video_vm)
-        )
-        g_layout.addWidget(self.btn_video_vm)
-        g_layout.addWidget(self.lbl_video_vm)
-
-        # Model
-        self.btn_model_vm = QPushButton("Browse Cellpose Model")
-        self.lbl_model_vm = QLabel("No file selected")
-        self.lbl_model_vm.setWordWrap(True)
-        self.btn_model_vm.clicked.connect(
-            lambda: self.select_model(label=self.lbl_model_vm)
-        )
-        g_layout.addWidget(self.btn_model_vm)
-        g_layout.addWidget(self.lbl_model_vm)
-
+        :param rows: tuples of (suffix of the attribute names, button text, file picker)
+        :return: returns the page
+        :rtype: QWidget
+        """
+        page, g_layout = _settings_page("File Selection")
+        for name, text, picker in rows:
+            button = QPushButton(text)
+            label = QLabel("No file selected")
+            label.setWordWrap(True)
+            button.clicked.connect(
+                lambda _=False, picker=picker, label=label: picker(label=label)
+            )
+            setattr(self, f"btn_{name}", button)
+            setattr(self, f"lbl_{name}", label)
+            g_layout.addWidget(button)
+            g_layout.addWidget(label)
         g_layout.addStretch(1)
-        page_layout.addWidget(group)
         return page
+
+    def create_video_model_page(self) -> QWidget:
+        return self._file_page(
+            [
+                ("video_vm", "Browse Video", self.select_image),
+                ("model_vm", "Browse Cellpose Model", self.select_model),
+            ]
+        )
 
     def create_video_labels_page(self) -> QWidget:
-        page = QWidget()
-        page_layout = QVBoxLayout(page)
-        page_layout.setContentsMargins(
-            0, 0, 0, 0
-        )  # keep the page flush with the group box
-        page_layout.setSpacing(0)
-        page_layout.setSizeConstraint(QLayout.SetMinimumSize)
-
-        group = QGroupBox("File Selection")
-        group.setStyleSheet("QGroupBox { font-weight: bold; font-size: 14px; }")
-        g_layout = QVBoxLayout(group)
-        g_layout.setSpacing(6)
-        group.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Minimum)
-
-        # Video
-        self.btn_video_vl = QPushButton("Browse Video")
-        self.lbl_video_vl = QLabel("No file selected")
-        self.lbl_video_vl.setWordWrap(True)
-        self.btn_video_vl.clicked.connect(
-            lambda: self.select_image(label=self.lbl_video_vl)
+        return self._file_page(
+            [
+                ("video_vl", "Browse Video", self.select_image),
+                ("labels_vl", "Browse Label Image", self.select_label_image),
+            ]
         )
-        g_layout.addWidget(self.btn_video_vl)
-        g_layout.addWidget(self.lbl_video_vl)
-
-        # Labels
-        self.btn_labels_vl = QPushButton("Browse Label Image")
-        self.lbl_labels_vl = QLabel("No file selected")
-        self.lbl_labels_vl.setWordWrap(True)
-        self.btn_labels_vl.clicked.connect(
-            lambda: self.select_label_image(label=self.lbl_labels_vl)
-        )
-        g_layout.addWidget(self.btn_labels_vl)
-        g_layout.addWidget(self.lbl_labels_vl)
-
-        g_layout.addStretch(1)
-        page_layout.addWidget(group)
-        return page
 
     def create_video_labels_csv_page(self) -> QWidget:
-        page = QWidget()
-        page_layout = QVBoxLayout(page)
-        page_layout.setContentsMargins(
-            0, 0, 0, 0
-        )  # keep the page flush with the group box
-        page_layout.setSpacing(0)
-        page_layout.setSizeConstraint(QLayout.SetMinimumSize)
-
-        group = QGroupBox("File Selection")
-        group.setStyleSheet("QGroupBox { font-weight: bold; font-size: 14px; }")
-        g_layout = QVBoxLayout(group)
-        g_layout.setSpacing(6)
-        group.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Minimum)
-
-        # Video
-        self.btn_video_vlc = QPushButton("Browse Video")
-        self.lbl_video_vlc = QLabel("No file selected")
-        self.lbl_video_vlc.setWordWrap(True)
-        self.btn_video_vlc.clicked.connect(
-            lambda: self.select_image(label=self.lbl_video_vlc)
+        return self._file_page(
+            [
+                ("video_vlc", "Browse Video", self.select_image),
+                ("labels_vlc", "Browse Label Image", self.select_label_image),
+                ("csv_vlc", "Browse Raw Intensities", self.select_mean_intensities),
+            ]
         )
-        g_layout.addWidget(self.btn_video_vlc)
-        g_layout.addWidget(self.lbl_video_vlc)
-
-        # Labels
-        self.btn_labels_vlc = QPushButton("Browse Label Image")
-        self.lbl_labels_vlc = QLabel("No file selected")
-        self.lbl_labels_vlc.setWordWrap(True)
-        self.btn_labels_vlc.clicked.connect(
-            lambda: self.select_label_image(label=self.lbl_labels_vlc)
-        )
-        g_layout.addWidget(self.btn_labels_vlc)
-        g_layout.addWidget(self.lbl_labels_vlc)
-
-        # CSV
-        self.btn_csv_vlc = QPushButton("Browse Raw Intensities")
-        self.lbl_csv_vlc = QLabel("No file selected")
-        self.lbl_csv_vlc.setWordWrap(True)
-        self.btn_csv_vlc.clicked.connect(
-            lambda: self.select_mean_intensities(label=self.lbl_csv_vlc)
-        )
-        g_layout.addWidget(self.btn_csv_vlc)
-        g_layout.addWidget(self.lbl_csv_vlc)
-
-        g_layout.addStretch(1)
-        page_layout.addWidget(group)
-        return page
 
     # ---------- FILE PICKERS ----------
     def select_image(self, label):
@@ -315,21 +254,25 @@ class FileSelectionWindow(QWidget):
         )
         if path:
             self.image_path = path
+            self._forget_previous_video()
             self.set_last_directory("last_image_dir", path)
             filename = os.path.basename(path)
             label.setText(f"Selected Image: {filename}")
             label.setToolTip(path)
 
-            # Look for analysis parameter file in subfolder
-            video_stem = Path(path).stem
-            settings_dir = Path(path).parent / f"Analysis_{video_stem}"
+            # Look for the analysis files of this video. Videos that already lie in an
+            # analysis folder use that folder instead of a nested one.
 
             # try to auto-load analysis parameters
-            param_file = settings_dir / f"{video_stem}_analysis_parameters.csv"
-            param_output = settings_dir / f"{video_stem}_analysis_output.csv"
-            if param_file.exists() and param_output.exists() and (self.label_csv_radio.isChecked() or self.model_radio.isChecked()):
+            param_file = Path(get_analysis_file(path, "analysis_parameters.csv"))
+            param_output = Path(get_analysis_file(path, "analysis_output.csv"))
+            if (
+                param_file.exists()
+                and param_output.exists()
+                and (self.label_csv_radio.isChecked() or self.model_radio.isChecked())
+            ):
                 try:
-                    self.analysis_params = self.parse_analysis_csv(param_file, output="AnalysisParameters")
+                    self.analysis_params = AnalysisParameters.from_csv(str(param_file))
                 except Exception as e:
                     QMessageBox.critical(
                         self,
@@ -337,7 +280,7 @@ class FileSelectionWindow(QWidget):
                         f"Could not load parameters from {param_file}:\n{e}",
                     )
                 try:
-                    self.output_params = self.parse_analysis_csv(param_output, output="AnalysisOutput")
+                    self.output_params = AnalysisOutput.from_csv(str(param_output))
                 except Exception as e:
                     QMessageBox.critical(
                         self,
@@ -345,28 +288,49 @@ class FileSelectionWindow(QWidget):
                         f"Could not load outputs from {param_output}:\n{e}",
                     )
                 self.load_param_button.setEnabled(False)
-                self.load_param_button.setText(f"Inferred Parameters from {param_file.name}")
+                self.load_param_button.setText(
+                    f"Inferred Parameters from {param_file.name}"
+                )
             # try to auto-load masks
-            mask_file = settings_dir / f"{video_stem}_cp_masks.ome.tif"
+            mask_file = Path(get_analysis_file(path, "cp_masks.ome.tif"))
             if mask_file.exists() and (
                 self.label_radio.isChecked() or self.label_csv_radio.isChecked()
             ):
                 self.label_image_path = str(mask_file)
-                if self.label_radio.isChecked() or self.label_csv_radio.isChecked():
-                    self.lbl_labels_vl.setText(f"Auto-detected Mask: {mask_file.name}")
-                    self.lbl_labels_vl.setToolTip(str(mask_file))
-                    self.lbl_labels_vlc.setText(f"Auto-detected Mask: {mask_file.name}")
-                    self.lbl_labels_vlc.setToolTip(str(mask_file))
+                self._auto_detected.add("label_image_path")
+                for label in (self.lbl_labels_vl, self.lbl_labels_vlc):
+                    label.setText(f"Auto-detected Mask: {mask_file.name}")
+                    label.setToolTip(str(mask_file))
 
             # try to auto-load raw intensities
-            intensities_file = settings_dir / f"{video_stem}_raw_intensities.csv.zst"
+            intensities_file = Path(get_analysis_file(path, "raw_intensities.csv.zst"))
             if intensities_file.exists() and self.label_csv_radio.isChecked():
                 self.mean_intensities_path = str(intensities_file)
-                if self.label_csv_radio.isChecked():
-                    self.lbl_csv_vlc.setText(
-                        f"Auto-detected Intensities: {intensities_file.name}"
-                    )
-                    self.lbl_csv_vlc.setToolTip(str(intensities_file))
+                self._auto_detected.add("mean_intensities_path")
+                self.lbl_csv_vlc.setText(
+                    f"Auto-detected Intensities: {intensities_file.name}"
+                )
+                self.lbl_csv_vlc.setToolTip(str(intensities_file))
+
+    def _forget_previous_video(self) -> None:
+        """
+        Drops everything that belonged to the previously selected video: its loaded
+        parameters and outputs, and the masks and intensities found in its analysis
+        folder. Files the user picked by hand are kept.
+        """
+        self.analysis_params = None
+        self.output_params = None
+        self.load_param_button.setText("Load Analysis Parameters")
+        if "label_image_path" in self._auto_detected:
+            self.label_image_path = None
+            for label in (self.lbl_labels_vl, self.lbl_labels_vlc):
+                label.setText("No file selected")
+                label.setToolTip("")
+        if "mean_intensities_path" in self._auto_detected:
+            self.mean_intensities_path = None
+            self.lbl_csv_vlc.setText("No file selected")
+            self.lbl_csv_vlc.setToolTip("")
+        self._auto_detected = set()
 
     def select_model(self, label):
         last_dir = self.get_last_directory("last_model_dir")
@@ -390,6 +354,7 @@ class FileSelectionWindow(QWidget):
         )
         if path:
             self.label_image_path = path
+            self._auto_detected.discard("label_image_path")
             filename = os.path.basename(path)
             label.setText(f"Selected Label Image: {filename}")
             label.setToolTip(path)
@@ -404,104 +369,26 @@ class FileSelectionWindow(QWidget):
         )
         if path:
             self.mean_intensities_path = path
+            self._auto_detected.discard("mean_intensities_path")
             filename = os.path.basename(path)
             label.setText(f"Selected Intensity File: {filename}")
             label.setToolTip(path)
 
-    # ---------- ANALYSIS PARAMETER LOADING ----------
-    def load_analysis_parameters(self):
-        if not self.analysis_param_path or not os.path.exists(self.analysis_param_path):
-            QMessageBox.warning(self, "Not Found", "No analysis parameters file found.")
-            return
-
-        try:
-            params = self.parse_analysis_csv(self.analysis_param_path)
-            self.load_param_button.setEnabled(False)  # Start greyed out
-            self.load_param_button.setText("Parameters Loaded")
-        except Exception as e:
-            QMessageBox.critical(
-                self, "Load Failed", f"Could not load parameters:\n{e}"
-            )
-            return
-
-        # Extract with correct keys (all lowercase)
-        tproj_type = params.get("tproj_type", "").upper()
-        clahe_value = params.get("clahe_normalize", "").lower()
-        frame_interval = params.get("frame_interval", "")
-        model_path = params.get("cellpose_model_path", "")
-
-        # Update UI fields
-        if tproj_type == "STD":
-            self.std_button.setChecked(True)
-        elif tproj_type == "SUM":
-            self.sum_button.setChecked(True)
-
-        self.clahe_checkbox.setChecked(clahe_value in ("1", "true", "yes"))
-
-        if frame_interval:
-            self.frame_input.setText(str(frame_interval))
-
-        # Optionally, auto-set model path if model_radio is selected and path is valid
-        if model_path and self.model_radio.isChecked() and os.path.exists(model_path):
-            self.model_path = model_path
-            filename = os.path.basename(model_path)
-            self.model_label.setText(f"Selected Model: {filename}")
-            self.model_label.setToolTip(model_path)
-
-        QMessageBox.information(
-            self, "Loaded", f"Loaded parameters from {self.analysis_param_path}"
-        )
-
-    def parse_analysis_csv(self, csv_path: str, output:str):
-        """
-        Reads CSV and returns an AnalysisParams instance.
-        Matches headers case-insensitively and auto-converts types from type hints.
-        """
-        with open(csv_path, newline="") as f:
-            reader = csv.DictReader(f)
-            first_row = next(reader, None)
-
-        if first_row is None:
-            raise ValueError(f"No data rows found in {csv_path}")
-
-        # Map CSV keys to lowercase for flexible matching
-        csv_key_map = {k.lower().strip(): k for k in first_row.keys()}
-
-        params = {}
-        if output == "AnalysisParameters":
-            for fdesc in fields(AnalysisParameters):
-                field_lower = fdesc.name.lower()
-                if field_lower in csv_key_map:
-                    csv_key = csv_key_map[field_lower]
-                    raw_val = first_row[csv_key]
-                    params[fdesc.name] = _auto_cast(raw_val, fdesc.type)
-            return AnalysisParameters(**params)
-        elif output == "AnalysisOutput":
-            for fdesc in fields(AnalysisOutput):
-                field_lower = fdesc.name.lower()
-                if field_lower in csv_key_map:
-                    csv_key = csv_key_map[field_lower]
-                    raw_val = first_row[csv_key]
-                    params[fdesc.name] = _auto_cast(raw_val, fdesc.type)
-            return AnalysisOutput(**params)
-        else: 
-            return params
-
     # ---------- ANALYSIS SETTINGS  ----------
-    def create_analysis_settings_model(self) -> QWidget:
-        page = QWidget()
-        page_layout = QVBoxLayout(page)
-        page_layout.setContentsMargins(
-            0, 0, 0, 0
-        )  # keep the page flush with the group box
-        page_layout.setSpacing(0)
-        page_layout.setSizeConstraint(QLayout.SetMinimumSize)
+    def create_analysis_settings(self) -> QWidget:
+        """
+        Builds the analysis settings. The projection and CLAHE settings are only used to
+        segment with Cellpose and only shown in that mode, the frame interval box is
+        shared by all modes.
+        """
+        page, g_layout = _settings_page("Analysis Settings")
+        # the height follows the rows that are shown in the current mode
+        page.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
 
-        group = QGroupBox("Analysis Settings")
-        group.setStyleSheet("QGroupBox { font-weight: bold; font-size: 14px; }")
-        g_layout = QVBoxLayout()
-        g_layout.setSpacing(6)
-        group.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Minimum)
+        self.cellpose_settings = QWidget()
+        cellpose_layout = QVBoxLayout(self.cellpose_settings)
+        cellpose_layout.setContentsMargins(0, 0, 0, 0)
+        cellpose_layout.setSpacing(6)
 
         # T-projection method
         tproj_row = QHBoxLayout()
@@ -515,7 +402,7 @@ class FileSelectionWindow(QWidget):
         tproj_row.addWidget(self.std_button)
         tproj_row.addWidget(self.sum_button)
         tproj_row.addStretch()
-        g_layout.addLayout(tproj_row)
+        cellpose_layout.addLayout(tproj_row)
 
         # Restore saved T-projection
         saved_proj = self.config.get("t_projection", "STD").upper()
@@ -524,7 +411,11 @@ class FileSelectionWindow(QWidget):
         # CLAHE
         self.clahe_checkbox = QCheckBox("Apply CLAHE normalization")
         self.clahe_checkbox.setChecked(self.config.get("clahe", False))
-        g_layout.addWidget(self.clahe_checkbox)
+        cellpose_layout.addWidget(self.clahe_checkbox)
+
+        g_layout.addWidget(self.cellpose_settings)
+        self.cellpose_settings.setVisible(self.model_radio.isChecked())
+        self.model_radio.toggled.connect(self.cellpose_settings.setVisible)
 
         # Frame interval
         frame_interval_layout = QHBoxLayout()
@@ -536,39 +427,184 @@ class FileSelectionWindow(QWidget):
         frame_interval_layout.addWidget(self.frame_input)
         g_layout.addLayout(frame_interval_layout)
 
+        # the video is read once if its intensity channel fits into memory; otherwise
+        # it can be kept in a temporary file instead of reading the video again
+        self.temp_file_checkbox = QCheckBox("Save temporary file on disk")
+        self.temp_file_checkbox.setToolTip(
+            "If the intensity channel of the video does not fit into memory, keep it in a "
+            "temporary file on the internal drive instead of reading the video a second "
+            "time. Faster for videos on external or network drives."
+        )
+        self.temp_file_checkbox.setChecked(self.config.get("save_temp_file", True))
+        g_layout.addWidget(self.temp_file_checkbox)
+
         g_layout.addStretch(1)
-        group.setLayout(g_layout)
-        page_layout.addWidget(group)
         return page
 
-    def create_analysis_settings_other(self) -> QWidget:
-        page = QWidget()
-        page_layout = QVBoxLayout(page)
-        page_layout.setContentsMargins(
-            0, 0, 0, 0
-        )  # keep the page flush with the group box
-        page_layout.setSpacing(0)
-        page_layout.setSizeConstraint(QLayout.SetMinimumSize)
+    # ---------- MOTION CORRECTION SETTINGS ----------
+    def create_motion_correction_group(self) -> QGroupBox:
+        """
+        Builds the motion correction settings. The correction is disabled by default and
+        its settings are only enabled once the user ticks the checkbox.
 
-        group = QGroupBox("Analysis Settings")
-        group.setStyleSheet("QGroupBox { font-weight: bold; font-size: 14px; }")
+        :return: returns the group box holding the motion correction settings
+        :rtype: QGroupBox
+        """
+        group = QGroupBox("Motion Correction")
+        group.setStyleSheet(GROUP_BOX_STYLE)
+        group.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Minimum)
         g_layout = QVBoxLayout(group)
         g_layout.setSpacing(6)
-        group.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Minimum)
 
-        # Frame interval
-        frame_interval_layout = QHBoxLayout()
-        frame_interval_layout.addWidget(QLabel("Frame interval (s, optional):"))
-        self.frame_input = QLineEdit()
-        self.frame_input.setPlaceholderText("e.g. 2.50")
-        if "frame_interval" in self.config:
-            self.frame_input.setText(str(self.config["frame_interval"]))
-        frame_interval_layout.addWidget(self.frame_input)
-        g_layout.addLayout(frame_interval_layout)
+        self.motion_correction_checkbox = QCheckBox("Correct lateral (xy) motion")
+        self.motion_correction_checkbox.setToolTip(
+            "Aligns every frame to a template before segmentation and intensity extraction. "
+            "The corrected video is saved into the analysis folder."
+        )
+        self.motion_correction_checkbox.setChecked(
+            bool(self.config.get("motion_correction", False))
+        )
+        g_layout.addWidget(self.motion_correction_checkbox)
 
-        g_layout.addStretch(1)
-        page_layout.addWidget(group)
-        return page
+        # container for all settings, greyed out while the correction is disabled
+        self.motion_settings_widget = QWidget()
+        settings_layout = QFormLayout(self.motion_settings_widget)
+        settings_layout.setContentsMargins(0, 0, 0, 0)
+        settings_layout.setSpacing(5)
+
+        self.motion_method_combo = QComboBox()
+        self.motion_method_combo.addItems(MOTION_CORRECTION_METHODS)
+        saved_method = self.config.get("motion_correction_method", "warp_grid")
+        if saved_method in MOTION_CORRECTION_METHODS:
+            self.motion_method_combo.setCurrentText(saved_method)
+        settings_layout.addRow("Method:", self.motion_method_combo)
+
+        self.motion_channel_spin = QSpinBox()
+        self.motion_channel_spin.setMinimum(0)
+        self.motion_channel_spin.setMaximum(9)
+        self.motion_channel_spin.setValue(
+            int(self.config.get("motion_correction_channel", 1))
+        )
+        self.motion_channel_spin.setToolTip(
+            "Channel the motion is estimated on. Works best on a channel with stationary labeling. "
+            "Single-channel videos always use channel 0."
+        )
+        settings_layout.addRow("Estimate on channel:", self.motion_channel_spin)
+
+        self.motion_template_frames_spin = QSpinBox()
+        self.motion_template_frames_spin.setMinimum(1)
+        self.motion_template_frames_spin.setMaximum(1000)
+        self.motion_template_frames_spin.setValue(
+            int(self.config.get("motion_correction_template_frames", 10))
+        )
+        settings_layout.addRow("Template frames:", self.motion_template_frames_spin)
+
+        self.motion_average_frames_spin = QSpinBox()
+        self.motion_average_frames_spin.setMinimum(1)
+        self.motion_average_frames_spin.setMaximum(99)
+        self.motion_average_frames_spin.setValue(
+            int(self.config.get("motion_correction_average_frames", 3))
+        )
+        self.motion_average_frames_spin.setToolTip(
+            "Number of frames averaged before the motion is estimated. The correction "
+            "itself is always applied to the single frame."
+        )
+        settings_layout.addRow("Averaged frames:", self.motion_average_frames_spin)
+
+        self.motion_template_filter_spin = QDoubleSpinBox()
+        self.motion_template_filter_spin.setDecimals(3)
+        self.motion_template_filter_spin.setSingleStep(0.01)
+        self.motion_template_filter_spin.setMinimum(0.0)
+        self.motion_template_filter_spin.setMaximum(1.0)
+        self.motion_template_filter_spin.setValue(
+            float(self.config.get("motion_correction_template_filter", 0.0))
+        )
+        self.motion_template_filter_spin.setToolTip(
+            "Factor to update the template with every corrected frame. 0 keeps the template fixed."
+        )
+        settings_layout.addRow("Template filter:", self.motion_template_filter_spin)
+
+        self.motion_grid_size_spin = QSpinBox()
+        self.motion_grid_size_spin.setMinimum(2)
+        self.motion_grid_size_spin.setMaximum(100)
+        self.motion_grid_size_spin.setValue(
+            int(self.config.get("motion_correction_grid_size", 10))
+        )
+        self.motion_grid_size_label = QLabel("Mesh grid size:")
+        settings_layout.addRow(self.motion_grid_size_label, self.motion_grid_size_spin)
+
+        self.motion_polynomial_degree_spin = QSpinBox()
+        self.motion_polynomial_degree_spin.setMinimum(1)
+        self.motion_polynomial_degree_spin.setMaximum(5)
+        self.motion_polynomial_degree_spin.setValue(
+            int(self.config.get("motion_correction_polynomial_degree", 2))
+        )
+        self.motion_polynomial_degree_label = QLabel("Polynomial degree:")
+        settings_layout.addRow(
+            self.motion_polynomial_degree_label, self.motion_polynomial_degree_spin
+        )
+
+        self.motion_mask_fov_checkbox = QCheckBox(
+            "Mask pixels that left the field of view"
+        )
+        self.motion_mask_fov_checkbox.setChecked(
+            bool(self.config.get("motion_correction_mask_fov", False))
+        )
+        settings_layout.addRow(self.motion_mask_fov_checkbox)
+
+        g_layout.addWidget(self.motion_settings_widget)
+
+        self.motion_correction_checkbox.toggled.connect(
+            self.motion_settings_widget.setEnabled
+        )
+        self.motion_method_combo.currentTextChanged.connect(
+            self._update_motion_method_fields
+        )
+        self.motion_settings_widget.setEnabled(
+            self.motion_correction_checkbox.isChecked()
+        )
+        self._update_motion_method_fields(self.motion_method_combo.currentText())
+
+        return group
+
+    def _update_motion_method_fields(self, method: str) -> None:
+        """
+        Only shows the settings that are used by the currently selected method.
+
+        :param method: currently selected motion correction method
+        :type method: str
+        """
+        is_grid = method == "warp_grid"
+        is_polynomial = method == "warp_polynomial_fit"
+
+        self.motion_grid_size_label.setVisible(is_grid)
+        self.motion_grid_size_spin.setVisible(is_grid)
+        self.motion_polynomial_degree_label.setVisible(is_polynomial)
+        self.motion_polynomial_degree_spin.setVisible(is_polynomial)
+
+    def apply_motion_correction_settings(self, params: AnalysisParameters) -> None:
+        """
+        Writes the motion correction settings into the analysis parameters and stores
+        them in the user settings.
+
+        :param params: analysis parameters to be updated
+        :type params: AnalysisParameters
+        """
+        settings = {
+            "motion_correction": self.motion_correction_checkbox.isChecked(),
+            "motion_correction_method": self.motion_method_combo.currentText(),
+            "motion_correction_channel": self.motion_channel_spin.value(),
+            "motion_correction_template_frames": self.motion_template_frames_spin.value(),
+            "motion_correction_average_frames": self.motion_average_frames_spin.value(),
+            "motion_correction_template_filter": self.motion_template_filter_spin.value(),
+            "motion_correction_grid_size": self.motion_grid_size_spin.value(),
+            "motion_correction_polynomial_degree": self.motion_polynomial_degree_spin.value(),
+            "motion_correction_mask_fov": self.motion_mask_fov_checkbox.isChecked(),
+        }
+        for name, value in settings.items():
+            setattr(params, name, value)
+            self.config[name] = value
+        self.save_settings()
 
     # ---------- CONFIRM ----------
     def confirm_selection(self):
@@ -596,21 +632,19 @@ class FileSelectionWindow(QWidget):
                 )
                 return
 
-        if self.std_button.isChecked():
-            tproj = "STD"
-        elif self.sum_button.isChecked():
-            tproj = "SUM"
-        else:
+        if not (self.std_button.isChecked() or self.sum_button.isChecked()):
             QMessageBox.warning(
                 self, "Missing Selection", "Please select a T-projection method."
             )
             return
 
+        tproj = "std" if self.std_button.isChecked() else "sum"
         clahe = self.clahe_checkbox.isChecked()
         frame_text = self.frame_input.text().strip()
+        frame_interval = None
         if frame_text:
             try:
-                frame_interval = round(float(frame_text), 2)
+                frame_interval = float(frame_text.replace(",", "."))
             except ValueError:
                 QMessageBox.warning(
                     self,
@@ -618,12 +652,15 @@ class FileSelectionWindow(QWidget):
                     "Frame interval must be a number (e.g. 2.50).",
                 )
                 return
+            # remembered as entered, a rounded value would be used by the next analysis
             self.config["frame_interval"] = frame_interval
         else:
             self.config.pop("frame_interval", None)
 
-        self.config["t_projection"] = tproj
+        self.config["t_projection"] = tproj.upper()
         self.config["clahe"] = clahe
+        save_temp_file = self.temp_file_checkbox.isChecked()
+        self.config["save_temp_file"] = save_temp_file
         self.save_settings()
 
         # Start progress bar
@@ -631,35 +668,37 @@ class FileSelectionWindow(QWidget):
         self.repaint()
 
         # --- Run Analysis ---
-        tproj = "std" if self.std_button.isChecked() else "sum"
-        clahe = self.clahe_checkbox.isChecked()
-        frame_text = self.frame_input.text().strip()
-        frame_interval = float(frame_text) if frame_text else None
         cellpose_model_path = self.model_path if self.model_radio.isChecked() else None
 
         # TODO - allow overriding analysis/output params here
-        if not hasattr(self, "analysis_params"):
+        if self.analysis_params is None:
             self.analysis_params = AnalysisParameters(
                 tproj_type=tproj,
                 CLAHE_normalize=clahe,
                 cellpose_model_path=cellpose_model_path,
                 frame_interval=frame_interval,
             )
-        elif self.model_radio.isChecked():
-            self.analysis_params.tproj_type = tproj
-            self.analysis_params.CLAHE_normalize = clahe
-            self.analysis_params.cellpose_model_path = cellpose_model_path
+        else:
+            if self.model_radio.isChecked():
+                self.analysis_params.tproj_type = tproj
+                self.analysis_params.CLAHE_normalize = clahe
+                self.analysis_params.cellpose_model_path = cellpose_model_path
+            # the frame interval box is shown in every mode and always wins over loaded
+            # parameters; left empty, the frame interval of the metadata is used
             self.analysis_params.frame_interval = frame_interval
-        if not hasattr(self, "output_params"):
+
+        # the motion correction widgets always win over loaded parameters
+        self.apply_motion_correction_settings(self.analysis_params)
+
+        if self.output_params is None:
             self.output_params = AnalysisOutput(filepath=self.image_path)
-            self.output_params.filename = self.output_params.filepath.split("/")[-1]
+            self.output_params.filename = os.path.basename(self.output_params.filepath)
             self.output_params.masks_path = (
                 self.label_image_path if not self.model_radio.isChecked() else None
             )
         elif self.label_radio.isChecked() or self.label_csv_radio.isChecked():
             self.output_params.masks_path = self.label_image_path
 
-        self.thread = QThread()
         if self.model_radio.isChecked():
             mode = "cellpose"
         elif self.label_radio.isChecked():
@@ -672,42 +711,43 @@ class FileSelectionWindow(QWidget):
             )
             return
         self.worker = ExtractIntensitiesWorker(
-            self.analysis_params, self.output_params, mode, self.mean_intensities_path
+            self.analysis_params,
+            self.output_params,
+            mode,
+            self.mean_intensities_path,
+            save_temp_file=save_temp_file,
         )
-        self.worker.moveToThread(self.thread)
-
-        # Connect signals
-        self.thread.started.connect(self.worker.run)
         self.worker.progress_changed.connect(self.update_progress)
-        self.worker.finished.connect(self.analysis_done)
-        self.worker.error.connect(self.analysis_failed)
-        self.worker.finished.connect(self.thread.quit)
-        self.worker.finished.connect(self.worker.deleteLater)
-        self.thread.finished.connect(self.thread.deleteLater)
 
         # Show progress bar
         self.progress_bar.setVisible(True)
         self.progress_bar.setValue(0)
 
-        # Start analysis thread
-        self.thread.start()
+        # Start analysis thread, blocking repeated starts until it is done
+        self.confirm_button.setEnabled(False)
+        start_worker(self, self.worker, self.analysis_done, self.analysis_failed)
 
     # ---------- ANALYSIS WORKER -----------
     def update_progress(self, percent, message):
         self.progress_bar.setValue(percent)
-        if hasattr(self, "progress_label"):
-            self.progress_label.setText(message)  # Optional if you use a label
+        self.progress_label.setText(message)
 
     def analysis_done(self, results):
         self.progress_bar.setVisible(False)
+        if getattr(self, "close_when_finished", False):
+            return  # the user closed the window, so no main window is opened
         self.analysis_complete.emit(results)
 
     def analysis_failed(self, error_msg):
         self.progress_bar.setVisible(False)
+        self.confirm_button.setEnabled(True)
+        if getattr(self, "close_when_finished", False):
+            return
         QMessageBox.critical(self, "Analysis Error", error_msg)
-        # shut down the thread
-        if hasattr(self, "_active_thread") and self._active_thread.isRunning():
-            self._active_thread.quit()
-            self._active_thread.wait()
-        self._active_thread = None
-        self._active_worker = None
+
+    def closeEvent(self, event):
+        if defer_close_while_running(self, event):
+            return
+        # a running QThread that is destroyed with its window aborts the application
+        stop_workers(self)
+        super().closeEvent(event)
