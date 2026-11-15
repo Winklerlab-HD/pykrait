@@ -1,7 +1,12 @@
 import numpy as np
 import pytest
-from pykrait.trace_analysis.oscillations import calculate_std_cov, get_random_std_covs, find_oscillating_rois
+from pykrait.trace_analysis.oscillations import (
+    calculate_std_cov,
+    get_random_std_covs,
+    find_oscillating_rois,
+)
 from pykrait.trace_analysis import oscillations
+
 
 def _col_from_peaks(T, peak_indices):
     """Build one ROI column (length T) with 1s at given indices."""
@@ -84,6 +89,7 @@ def test_frame_interval_scales_intervals():
     # cov = std / mean -> scale cancels out -> invariant
     assert np.isclose(cov_b[0], cov_a[0])
 
+
 def test_random_std_covs_shapes_and_finite():
     """
     For ROIs with ≥5 peaks, the randomized control should:
@@ -106,7 +112,9 @@ def test_random_std_covs_shapes_and_finite():
     n_iter = 3
     frame_interval = 1.0
 
-    sd, cov = get_random_std_covs(peak_series, frame_interval=frame_interval, n_iter=n_iter)
+    sd, cov = get_random_std_covs(
+        peak_series, frame_interval=frame_interval, n_iter=n_iter
+    )
 
     assert sd.shape == (peak_series.shape[1] * n_iter,)
     assert cov.shape == (peak_series.shape[1] * n_iter,)
@@ -119,10 +127,10 @@ def test_random_std_covs_shapes_and_finite():
     assert not np.allclose(sd, 0.0)
 
 
-def test_random_std_covs_deterministic_with_seed(monkeypatch):
+def test_random_std_covs_deterministic_with_seed():
     """
-    Make np.random.rand deterministic via a fixed-seed Generator,
-    then reproduce the exact shuffle externally and compare results.
+    With a fixed-seed Generator, the shuffle can be reproduced externally:
+    each iteration shuffles every column independently along the time axis.
     """
     T = 50
     # Single ROI with equal spacing: 5 peaks -> 4 intervals
@@ -132,36 +140,49 @@ def test_random_std_covs_deterministic_with_seed(monkeypatch):
     n_iter = 4
     frame_interval = 1.25
 
-    # Fixed-seed RNG for deterministic shuffling inside the function
-    rng_for_func = np.random.default_rng(123)
-
-    def fake_rand(*shape):
-        # np.random.rand(T, n) signature support
-        return rng_for_func.random(shape)
-
-    monkeypatch.setattr(np.random, "rand", fake_rand)
-
-    # Build expected result using the SAME shuffle recipe (but with a *separate* RNG
-    # of the same seed so state matches what get_random_std_covs will do).
-    rng_for_expected = np.random.default_rng(123)
-
-    # Expected stacked & shuffled
-    stacked = np.hstack([filtered_peak_series] * n_iter)  # (T, n_iter)
-    idx = np.argsort(rng_for_expected.random((T, stacked.shape[1])), axis=0)
-    stacked_shuffled = np.take_along_axis(stacked, idx, axis=0)
-
-    expected_sd, expected_cov = calculate_std_cov(stacked_shuffled, frame_interval=frame_interval)
-
-    # Call function under test (uses the monkeypatched np.random.rand)
     sd, cov = get_random_std_covs(
         filtered_peak_series,
         frame_interval=frame_interval,
         n_iter=n_iter,
+        rng=np.random.default_rng(123),
     )
 
-    # Exact equality should hold (no floating randomness beyond shuffling)
+    # Build expected result using the SAME shuffle recipe with a separate RNG of the same seed
+    rng_for_expected = np.random.default_rng(123)
+    shuffled = [
+        rng_for_expected.permuted(filtered_peak_series != 0, axis=0)
+        for _ in range(n_iter)
+    ]
+    expected_sd, expected_cov = calculate_std_cov(
+        np.hstack(shuffled), frame_interval=frame_interval
+    )
+
     np.testing.assert_allclose(sd, expected_sd, rtol=0, atol=0)
     np.testing.assert_allclose(cov, expected_cov, rtol=0, atol=0)
+
+    # a second call with the same seed gives the same result
+    sd2, cov2 = get_random_std_covs(
+        filtered_peak_series,
+        frame_interval=frame_interval,
+        n_iter=n_iter,
+        rng=np.random.default_rng(123),
+    )
+    np.testing.assert_array_equal(sd, sd2)
+    np.testing.assert_array_equal(cov, cov2)
+
+
+def test_random_std_covs_preserves_peak_counts():
+    T = 100
+    peak_series = np.stack(
+        [_col_from_peaks(T, [0, 20, 40, 60, 80]), _col_from_peaks(T, [1, 2, 3])], axis=1
+    )
+    sd, cov = get_random_std_covs(
+        peak_series, frame_interval=1.0, n_iter=5, rng=np.random.default_rng(0)
+    )
+    # ordered by iteration, then ROI: the ROI with 3 peaks (2 intervals) is always NaN
+    assert sd.shape == (10,)
+    assert np.isfinite(sd[0::2]).all()
+    assert np.isnan(sd[1::2]).all()
 
 
 def _dummy_peak_series(T=100, n_roi=3):
@@ -169,9 +190,9 @@ def _dummy_peak_series(T=100, n_roi=3):
     Build a small (T, n_roi) peak_series where each ROI has >=5 peaks (=> 4 intervals).
     """
     peaks_list = [
-        [0, 20, 40, 60, 80],     # equal spacing
-        [5, 30, 50, 70, 95],     # slightly offset
-        [10, 25, 45, 65, 90],    # uneven
+        [0, 20, 40, 60, 80],  # equal spacing
+        [5, 30, 50, 70, 95],  # slightly offset
+        [10, 25, 45, 65, 90],  # uneven
     ][:n_roi]
     cols = [_col_from_peaks(T, p) for p in peaks_list]
     return np.stack(cols, axis=1)
@@ -191,15 +212,30 @@ def test_invalid_method_raises():
 
 def test_invalid_cov_threshold_raises():
     peak_series = _dummy_peak_series()
-    # cov_threshold must be in [0, 1] (both branches)
+    # cov_threshold must be in [0, 1] when it is a quantile
     with pytest.raises(ValueError):
         find_oscillating_rois(
-            periodicity_method="cutoff",
+            periodicity_method="quantile",
             peak_series=peak_series,
-            std_threshold=1.0,
+            std_threshold=0.5,
             cov_threshold=1.1,
             frame_interval=1.0,
         )
+
+
+def test_cov_cutoff_above_one_is_allowed():
+    peak_series = _dummy_peak_series()
+    # as a cutoff, a CoV above 1 is a valid threshold
+    results, _, _ = find_oscillating_rois(
+        periodicity_method="cutoff",
+        peak_series=peak_series,
+        std_threshold=1.0,
+        cov_threshold=1.1,
+        frame_interval=1.0,
+        n_iter=5,
+    )
+    assert results["cov_cutoff"] == 1.1
+    assert results["experimental_below_cov"] == 3
 
 
 def test_invalid_std_quantile_raises_in_quantile_branch():
@@ -213,6 +249,7 @@ def test_invalid_std_quantile_raises_in_quantile_branch():
             cov_threshold=0.5,
             frame_interval=1.0,
         )
+
 
 def _col_from_peaks(T, idx):
     col = np.zeros(T, dtype=int)
@@ -254,11 +291,13 @@ def test_cutoff_branch_handcrafted(monkeypatch):
     calls = []
 
     def fake_get_random_std_covs(ps, fi, n_iter=100):
-            calls.append(n_iter)
-            if len(calls) == 1:
-                return np.array([0.0, 1.0, 2.0, 10.0, 20.0]), np.array([0.0, 0.1, 0.2, 0.4, 0.8])
-            else:
-                return np.array([0.0, 6.0]), np.array([0.2, 0.3])
+        calls.append(n_iter)
+        if len(calls) == 1:
+            return np.array([0.0, 1.0, 2.0, 10.0, 20.0]), np.array(
+                [0.0, 0.1, 0.2, 0.4, 0.8]
+            )
+        else:
+            return np.array([0.0, 6.0]), np.array([0.2, 0.3])
 
     monkeypatch.setattr(oscillations, "get_random_std_covs", fake_get_random_std_covs)
     # Run function
@@ -278,7 +317,7 @@ def test_cutoff_branch_handcrafted(monkeypatch):
     cov_roi2 = std_roi2 / 25.0  # ≈ 0.4472135955
 
     np.testing.assert_allclose(experimental_stds, [std_roi1, std_roi2])
-    np.testing.assert_allclose(experimental_covs,  [cov_roi1,  cov_roi2])
+    np.testing.assert_allclose(experimental_covs, [cov_roi1, cov_roi2])
 
     # Pass-through cutoffs
     assert results["std_cutoff"] == std_threshold
@@ -338,7 +377,9 @@ def test_quantile_branch_handcrafted(monkeypatch):
     def fake_get_random_std_covs(ps, fi, n_iter=100):
         calls.append(n_iter)
         if len(calls) == 1:
-            return np.array([0.0, 1.0, 2.0, 10.0, 20.0]), np.array([0.0, 0.1, 0.2, 0.4, 0.8])
+            return np.array([0.0, 1.0, 2.0, 10.0, 20.0]), np.array(
+                [0.0, 0.1, 0.2, 0.4, 0.8]
+            )
         else:
             return np.array([0.0, 6.0]), np.array([0.2, 0.3])
 
@@ -361,7 +402,7 @@ def test_quantile_branch_handcrafted(monkeypatch):
     cov_roi2 = std_roi2 / 25.0
 
     np.testing.assert_allclose(experimental_stds, [0.0, std_roi2])
-    np.testing.assert_allclose(experimental_covs,  [0.0, cov_roi2])
+    np.testing.assert_allclose(experimental_covs, [0.0, cov_roi2])
 
     # Cutoffs by hand:
     assert np.isclose(results["std_cutoff"], 5.2)
@@ -376,3 +417,43 @@ def test_quantile_branch_handcrafted(monkeypatch):
     assert results["experimental_below_cov"] == 1
     assert results["random_below_std"] == 1
     assert results["random_below_cov"] == 1
+
+
+def test_find_median_frequency_values_and_types():
+    from pykrait.trace_analysis.oscillations import find_median_frequency
+
+    T = 100
+    peak_series = np.stack(
+        [
+            _col_from_peaks(T, [0, 10, 20, 30]),  # 3 intervals of 10 frames
+            _col_from_peaks(T, [0, 20, 40, 60]),  # 3 intervals of 20 frames
+            _col_from_peaks(T, [5, 50]),  # 1 interval, not an active cell
+        ],
+        axis=1,
+    )
+    total_mHz, active_mHz, periods = find_median_frequency(
+        peak_series, frame_interval=2.0
+    )
+
+    # all intervals in seconds: [20, 20, 20, 40, 40, 40, 90] -> median 40 s -> 25 mHz
+    assert np.isclose(total_mHz, 25.0)
+    # cell periods: [20, 40, NaN] -> median 30 s
+    assert isinstance(periods, np.ndarray)
+    np.testing.assert_allclose(periods, [20.0, 40.0, np.nan])
+    assert np.isclose(active_mHz, 1000 / 30)
+
+
+def test_find_median_frequency_without_active_cells_is_nan():
+    from pykrait.trace_analysis.oscillations import find_median_frequency
+    import warnings
+
+    peak_series = np.zeros((50, 2), dtype=int)
+    peak_series[[5, 25], 0] = 1
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", RuntimeWarning)
+        total_mHz, active_mHz, periods = find_median_frequency(
+            peak_series, frame_interval=1.0
+        )
+    assert np.isclose(total_mHz, 50.0)
+    assert np.isnan(active_mHz)
+    assert np.isnan(periods).all()

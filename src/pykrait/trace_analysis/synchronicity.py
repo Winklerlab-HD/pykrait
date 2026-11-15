@@ -1,6 +1,8 @@
 import numpy as np
+from scipy import sparse
 from typing import Tuple
 import warnings
+
 
 def find_synchronous_peaks(
     shortest_path_matrix: np.ndarray,
@@ -23,16 +25,18 @@ def find_synchronous_peaks(
     :rtype: np.ndarray
     """
 
-    synchronous_cells_matrix = np.zeros(shortest_path_matrix.shape, dtype=np.uint8)
+    # int64 so that cell pairs with many coincident peaks (> 255) do not overflow
+    synchronous_cells_matrix = np.zeros(shortest_path_matrix.shape, dtype=np.int64)
 
     # find connected cells
-    cell_indices = np.where(
-        shortest_path_matrix == neighbour_degree
-    )
+    cell_indices = np.where(shortest_path_matrix == neighbour_degree)
     if cell_indices[0].size == 0 or cell_indices[1].size == 0:
-        warnings.warn(f"No connected cell pairs found for the specified neighbour degree of {neighbour_degree}.", UserWarning)
+        warnings.warn(
+            f"No connected cell pairs found for the specified neighbour degree of {neighbour_degree}.",
+            UserWarning,
+        )
         return synchronous_cells_matrix
-    
+
     peak_indices = [np.nonzero(t)[0] for t in peak_series.transpose()]
 
     for synchronous_cellpair in range(0, cell_indices[0].shape[0]):
@@ -43,7 +47,7 @@ def find_synchronous_peaks(
         )
 
         # some complex logical operations, built-in .__and__ basically means
-        # 0 < peak_differences <= self.FRAME_THRESHOLD
+        # 0 <= peak_differences <= frame_window
         synchronous_cells_matrix[
             cell_indices[0][synchronous_cellpair], cell_indices[1][synchronous_cellpair]
         ] = ((0 <= peak_differences).__and__(peak_differences <= frame_window)).sum()
@@ -54,6 +58,7 @@ def find_synchronous_peaks(
 
     return synchronous_cells_matrix
 
+
 def find_possible_synchronous_peaks(
     shortest_path_matrix: np.ndarray,
     peak_series: np.ndarray,
@@ -61,8 +66,8 @@ def find_possible_synchronous_peaks(
     frame_window: int,
 ) -> np.ndarray:
     """
-    finds the number of possible synchronous peaks between connected cells given a certain neighbourhood degree and time window. 
-    This assumes that one peak can only be synchronous with one other peak from a connected cell, so the maximum number of synchronous 
+    finds the number of possible synchronous peaks between connected cells given a certain neighbourhood degree and time window.
+    This assumes that one peak can only be synchronous with one other peak from a connected cell, so the maximum number of synchronous
     events is limited by the cell with the fewer peaks.
 
     :param shortest_path_matrix: ROI x ROI matrix with shortest path lengths between cells n and m
@@ -76,14 +81,17 @@ def find_possible_synchronous_peaks(
     :return: returns a ROI x ROI matrix with the number of possible synchronous peaks between connected cells
     :rtype: np.ndarray
     """
-    possible_synchronous_cells_matrix = np.zeros(shortest_path_matrix.shape, dtype=np.uint16)
+    possible_synchronous_cells_matrix = np.zeros(
+        shortest_path_matrix.shape, dtype=np.int64
+    )
 
     # find connected cells
-    cell_indices = np.where(
-        shortest_path_matrix == neighbour_degree
-    )
+    cell_indices = np.where(shortest_path_matrix == neighbour_degree)
     if cell_indices[0].size == 0 or cell_indices[1].size == 0:
-        warnings.warn(f"No connected cell pairs found for the specified neighbour degree of {neighbour_degree}.", UserWarning)
+        warnings.warn(
+            f"No connected cell pairs found for the specified neighbour degree of {neighbour_degree}.",
+            UserWarning,
+        )
         return possible_synchronous_cells_matrix
 
     n_peaks_per_cell = np.sum(peak_series, axis=0)
@@ -97,6 +105,7 @@ def find_possible_synchronous_peaks(
         )
 
     return possible_synchronous_cells_matrix
+
 
 def _random_synchronous_peaks(
     shortest_path_matrix: np.ndarray,
@@ -118,29 +127,75 @@ def _random_synchronous_peaks(
     :type frame_window: int
     :param n_iter: number of random permutations to bootstrap against, defaults to 100
     :type n_iter: int, optional
-    :return: returns a list of the number of synchronous peaks in the bootstrapped random control as well as the corresponding matrices
-    :rtype: Tuple[np.ndarray, np.ndarray, np.ndarray]
+    :return: returns the number of synchronous peaks for each of the n_iter random permutations, as well as
+        the ROI x ROI synchronous peaks matrix of the first permutation (as an example random control)
+    :rtype: Tuple[np.ndarray, np.ndarray]
     """
-    list_rand_matrices = np.zeros(
-        shape=(n_iter, shortest_path_matrix.shape[0], shortest_path_matrix.shape[1])
-    )
     count_rand_synchronous_peaks = np.zeros(shape=n_iter)
+    first_rand_matrix = np.zeros(shortest_path_matrix.shape, dtype=np.int64)
+
+    # Permuting the ROIs only reorders the rows and columns of the pairwise counts, so they
+    # are counted once for all ROI pairs and looked up for every permutation. The two
+    # entries find_synchronous_peaks fills for a connected cell pair together count its
+    # peak pairs within +-frame_window frames, also if the pair is listed in both triangles.
+    connected = shortest_path_matrix == neighbour_degree
+    # a cell connected to itself is not a cell pair, it is counted the original way
+    count_directly = bool(np.any(np.diagonal(connected)))
+    if not count_directly:
+        pairwise_counts = _count_peak_pairs_within_window(peak_series, frame_window)
+        rows, columns = np.nonzero(np.triu(connected | connected.T, k=1))
 
     for i in range(0, n_iter):
         # randomize the peak series
         orders = np.random.permutation(np.arange(peak_series.shape[1]))
-        random_peak_series = peak_series[:, orders]
 
-        # calculate the synchronous peaks
-        list_rand_matrices[i, :, :] = find_synchronous_peaks(
-            shortest_path_matrix=shortest_path_matrix,
-            peak_series=random_peak_series,
-            neighbour_degree=neighbour_degree,
-            frame_window=frame_window,
-        )
-        count_rand_synchronous_peaks[i] = np.sum(list_rand_matrices[i, :, :], axis=None)
+        # the matrix is only needed for the first permutation, as an example random control
+        if i == 0 or count_directly:
+            rand_matrix = find_synchronous_peaks(
+                shortest_path_matrix=shortest_path_matrix,
+                peak_series=peak_series[:, orders],
+                neighbour_degree=neighbour_degree,
+                frame_window=frame_window,
+            )
+        if i == 0:
+            first_rand_matrix = rand_matrix
 
-    return count_rand_synchronous_peaks, list_rand_matrices
+        if count_directly:
+            count_rand_synchronous_peaks[i] = np.sum(rand_matrix, axis=None)
+        else:
+            count_rand_synchronous_peaks[i] = np.sum(
+                pairwise_counts[orders[rows], orders[columns]]
+            )
+
+    return count_rand_synchronous_peaks, first_rand_matrix
+
+
+def _count_peak_pairs_within_window(
+    peak_series: np.ndarray, frame_window: int
+) -> np.ndarray:
+    """
+    counts for every pair of ROIs the pairs of peaks that are at most frame_window frames apart.
+
+    :param peak_series: T x ROI binary matrix with 1s at calcium peak frames
+    :type peak_series: np.ndarray
+    :param frame_window: time window within peaks are considered synchronous
+    :type frame_window: int
+    :return: returns a symmetric ROI x ROI matrix with the number of peak pairs within the window
+    :rtype: np.ndarray
+    """
+    n_frames = peak_series.shape[0]
+    peaks = sparse.csr_matrix((peak_series != 0).astype(np.int32))
+    # band matrix that sums the peaks within +-frame_window frames of every frame
+    offsets = range(
+        -min(frame_window, n_frames - 1), min(frame_window, n_frames - 1) + 1
+    )
+    window = sparse.diags(
+        [np.ones(n_frames - abs(offset), dtype=np.int32) for offset in offsets],
+        offsets=list(offsets),
+        shape=(n_frames, n_frames),
+        format="csr",
+    )
+    return (peaks.T @ (window @ peaks)).toarray()
 
 
 def calculate_synchronicity_zscore(
@@ -174,13 +229,16 @@ def calculate_synchronicity_zscore(
 
     # if there are no synchronous peaks, warn the user
     if true_synchronous_peaks == 0:
-        warnings.warn(f"No synchronous peaks found between connected cells for neighbour {neighbour_degree}. Synchronicity z-score will be NaN.", UserWarning)
+        warnings.warn(
+            f"No synchronous peaks found between connected cells for neighbour {neighbour_degree}. Synchronicity z-score will be NaN.",
+            UserWarning,
+        )
         return (
             np.nan,
             np.nan,
             np.zeros(true_synchronous_peaks_matrix.shape),
             np.zeros(true_synchronous_peaks_matrix.shape),
-            np.zeros(true_synchronous_peaks_matrix.shape)
+            np.zeros(true_synchronous_peaks_matrix.shape),
         )
 
     # finds random connected peaks to bootstrap against
@@ -188,9 +246,23 @@ def calculate_synchronicity_zscore(
         shortest_path_matrix, peak_series, neighbour_degree, frame_window, n_iter
     )
 
-    # calculates zscore
-    true_synchronicity_zscore = (true_synchronous_peaks - np.mean(rand_synchronous_peaks)) / np.std(rand_synchronous_peaks)
-    rand_synchronicity_zscore = (rand_synchronous_peaks[0] - np.mean(rand_synchronous_peaks)) / np.std(rand_synchronous_peaks)
+    # calculates zscore, a random control without any variance (e.g. only one possible permutation) has no defined zscore
+    rand_std = np.std(rand_synchronous_peaks)
+    if rand_std == 0:
+        warnings.warn(
+            f"The random control for neighbour {neighbour_degree} has zero variance. Synchronicity z-score will be NaN.",
+            UserWarning,
+        )
+        true_synchronicity_zscore = np.nan
+        rand_synchronicity_zscore = np.nan
+    else:
+        rand_mean = np.mean(rand_synchronous_peaks)
+        true_synchronicity_zscore = float(
+            (true_synchronous_peaks - rand_mean) / rand_std
+        )
+        rand_synchronicity_zscore = float(
+            (rand_synchronous_peaks[0] - rand_mean) / rand_std
+        )
 
     # calculate possible synchronous peaks matrices
     potential_synchronous_peaks_matrix = find_possible_synchronous_peaks(
@@ -200,6 +272,6 @@ def calculate_synchronicity_zscore(
         true_synchronicity_zscore,
         rand_synchronicity_zscore,
         true_synchronous_peaks_matrix,
-        rand_synchronous_peaks_matrix[0, :, :],
-        potential_synchronous_peaks_matrix
+        rand_synchronous_peaks_matrix,
+        potential_synchronous_peaks_matrix,
     )

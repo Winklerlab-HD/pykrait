@@ -1,10 +1,10 @@
+import logging
 import numpy as np
 import traceback
 import dask.array as da
-from matplotlib import cm
+from matplotlib import colormaps
 from pathlib import Path
 from typing import List
-import warnings
 
 from PySide6.QtWidgets import (
     QMainWindow,
@@ -23,17 +23,17 @@ from PySide6.QtWidgets import (
     QRadioButton,
     QButtonGroup,
     QLineEdit,
-    QScrollArea
+    QScrollArea,
 )
-from PySide6.QtCore import Qt, QPointF, Signal, QThread
+from PySide6.QtCore import Qt, QPointF, Signal
 from PySide6.QtGui import (
     QImage,
     QPixmap,
     QPen,
     QPolygonF,
     QAction,
-    QDoubleValidator,
     QBrush,
+    QTransform,
 )
 from PySide6.QtWidgets import (
     QGraphicsView,
@@ -46,23 +46,66 @@ from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.figure import Figure
 
 from pykrait.io.files import get_pykrait_version, concat_analysis_files
-from pykrait.io.images import read_image
-from pykrait.pipeline.pipeline import AnalysisParameters, AnalysisOutput
-from pykrait.gui.async_workers import (
-    DetrendWorker,
-    PeakDetectionWorker,
-    PeriodicCellWorker,
-    AnalysisSaveWorker,
-    SynchronicityWorker,
-    AdjacencyMatrixWorker
+from pykrait.io.images import read_projection
+from pykrait.pipeline.pipeline import (
+    AnalysisParameters,
+    AnalysisOutput,
+    neighbour_tolerance_in_pixels,
+    peak_widths_in_frames,
+    do_peak_analysis,
+    calculate_periodic_cells,
+    create_roi_dataframe,
+    calculate_synchronicity,
+    save_analysis_results,
 )
-from pykrait.gui.custom_widgets import ToggleSwitch, CollapsibleBox
+from pykrait.preprocessing.timeseries_extraction import get_adjacency_matrix
+from pykrait.trace_analysis.filtering import detrend_with_sinc_filter
+from pykrait.gui.async_workers import (
+    FunctionWorker,
+    defer_close_while_running,
+    start_worker,
+    stop_workers,
+    workers_running,
+)
+from pykrait.gui.custom_widgets import ToggleSwitch, CollapsibleBox, DecimalValidator
+
+logger = logging.getLogger(__name__)
+
+
+def _find_periodic_cells(peaks, analysis_params, analysis_output) -> tuple:
+    """Finds the periodic ROIs and collects the per-ROI results, run on a worker thread."""
+    analysis_output, stds, covs = calculate_periodic_cells(
+        peaks, analysis_params, analysis_output
+    )
+    roi_dataframe = create_roi_dataframe(peaks, stds, covs, analysis_output)
+    return analysis_output, stds, covs, roi_dataframe
+
+
+# decimals of the frame interval box, so that e.g. 30 fps (0.0333 s) is not shown as 0.03
+FRAME_INTERVAL_DECIMALS = 4
+
+
+def _double_spin_box(
+    decimals: int, minimum: float, maximum: float, value: float
+) -> QDoubleSpinBox:
+    """Creates a QDoubleSpinBox, the value is set after the range it is clamped to."""
+    spin_box = QDoubleSpinBox()
+    spin_box.setDecimals(decimals)
+    spin_box.setMinimum(minimum)
+    spin_box.setMaximum(maximum)
+    spin_box.setValue(value)
+    return spin_box
+
+
+def _save_with_projection(tproj_path: str, **kwargs) -> None:
+    """Reads the projection and saves the analysis results, run on a worker thread."""
+    save_analysis_results(tproj=read_projection(tproj_path), **kwargs)
 
 
 class ImageDisplay(QGraphicsView):
     roiSelected = Signal(int)
 
-    def __init__(self, parent=None, target_shape=(512, 512)):
+    def __init__(self, parent=None, max_display_size=512):
         super().__init__(parent)
         self.scene = QGraphicsScene(self)
         self.setScene(self.scene)
@@ -70,11 +113,11 @@ class ImageDisplay(QGraphicsView):
         self.scene.addItem(self.image_item)
         self.roi_items = []
         self.rois = []
-        self.target_shape = target_shape  # target shape for downsampling
+        # frames are downsampled for display, but the scene is kept in original pixel
+        # coordinates by scaling the pixmap back up, so ROIs never need rescaling
+        self.max_display_size = max_display_size
+        self.display_factor = 1
         self.selected_roi = None  # to track the active ROI
-        self.last_sinc_window = (
-            None  # to track the last used sinc window for detrending
-        )
         self.intensity_clip_min = None
         self.intensity_clip_max = None
 
@@ -90,6 +133,7 @@ class ImageDisplay(QGraphicsView):
             pen = QPen(Qt.white)  # White color
             pen.setWidth(1)  # Line width
             pen.setStyle(Qt.DashLine)  # Dashed line
+            pen.setCosmetic(True)  # width in screen pixels, independent of zoom
             roi_item = QGraphicsPolygonItem(polygon)
             roi_item.setPen(pen)
             roi_item.setBrush(Qt.NoBrush)  # No fill
@@ -111,6 +155,7 @@ class ImageDisplay(QGraphicsView):
                 pen.setWidth(1)
                 pen.setStyle(Qt.DashLine)
                 roi_item.setZValue(1)  # Normal level for unselected
+            pen.setCosmetic(True)
             roi_item.setPen(pen)
             roi_item.setBrush(Qt.NoBrush)
 
@@ -127,6 +172,8 @@ class ImageDisplay(QGraphicsView):
         self.clear_roi_centers()
 
         self.center_items = []
+        # the radius is given in displayed pixels, the scene is in original pixels
+        radius = radius * self.display_factor
 
         for i in indices:
             if i < 0 or i >= len(self.rois):
@@ -184,7 +231,9 @@ class ImageDisplay(QGraphicsView):
                     if i in centers and j in centers:
                         x1, y1 = centers[i]
                         x2, y2 = centers[j]
-                        line = self.scene.addLine(x1, y1, x2, y2, QPen(Qt.blue, 2))
+                        pen = QPen(Qt.blue, 2)
+                        pen.setCosmetic(True)
+                        line = self.scene.addLine(x1, y1, x2, y2, pen)
                         line.setZValue(1)  # behind the dots
                         self.connection_items.append(line)
 
@@ -217,22 +266,17 @@ class ImageDisplay(QGraphicsView):
         :param cmap: colormap to display in, defaults to 'magma'
         :type cmap: str, optional
         :raises ValueError: raises ValueError if the input frame is not a 2D array
-        :raises ValueError: raises ValueError if the original frame is too small for the target
         """
         if frame.ndim != 2:
             raise ValueError("Input frame must be a 2D array")
         h, w = frame.shape
 
-        # Compute coarsening factors
-        fh, fw = h // self.target_shape[0], w // self.target_shape[1]
-        if fh < 1 or fw < 1:
-            fh = 1
-            fw = 1
-            self.target_shape = frame.shape
-            warnings.warn(f"Original frame too small for target {self.target_shape}, using original shape", UserWarning)
+        # the same factor on both axes keeps the aspect ratio
+        factor = max(1, max(h, w) // self.max_display_size)
+        self.display_factor = factor
 
         # Downsample using mean pooling
-        frame_ds = da.coarsen(np.mean, frame, {0: fh, 1: fw}, trim_excess=True)
+        frame_ds = da.coarsen(np.mean, frame, {0: factor, 1: factor}, trim_excess=True)
         img = frame_ds.compute()
 
         # Normalize the image for optimized display
@@ -254,13 +298,15 @@ class ImageDisplay(QGraphicsView):
             )
 
         # Apply colormap
-        img_rgb = (cm.get_cmap(cmap)(norm)[..., :3] * 255).astype(np.uint8)
+        img_rgb = (colormaps[cmap](norm)[..., :3] * 255).astype(np.uint8)
 
         # Convert to QImage and display
         h_ds, w_ds, _ = img_rgb.shape
         qimg = QImage(img_rgb.data, w_ds, h_ds, 3 * w_ds, QImage.Format_RGB888)
         pix = QPixmap.fromImage(qimg)
         self.image_item.setPixmap(pix)
+        # each displayed pixel covers factor x factor original pixels
+        self.image_item.setTransform(QTransform.fromScale(factor, factor))
         self.fitInView(self.image_item, Qt.KeepAspectRatio)
 
 
@@ -274,10 +320,12 @@ class MainWindow(QMainWindow):
         analysis_output: AnalysisOutput,
         analysis_params: AnalysisParameters,
         app_controller=None,
+        display_channel: int = 0,
     ):
         super().__init__()
         self.app_controller = app_controller
         self.frames = frames
+        self.display_channel = display_channel  # channel the intensities come from
         self.masks = mask
         self.rois = rois
         self.intensities = mean_intensities
@@ -291,8 +339,17 @@ class MainWindow(QMainWindow):
         self.current_frame = 0
         self.show_detrended: bool = False
         self.detrended_intensities = None
+        self._detrending = False
         self.peaks = None
-        self.tproj = read_image(self.analysis_output.tproj_path)
+        self.last_sinc_window = (
+            None  # sinc window the detrended traces were computed with
+        )
+        self.experimental_stds = None
+        self.experimental_covs = None
+        self.roi_dataframe = None
+        self.adjacency_matrix = None
+        self.shortest_path_matrix = None
+        self.true_synchronous_peaks_matrix = None
         # menu bar
         self._create_menu_bar()
         # Central widget and main layout
@@ -301,29 +358,86 @@ class MainWindow(QMainWindow):
         self.setCentralWidget(central_widget)
 
         # -------- LEFT PANEL --------
-        left_panel = QVBoxLayout()
+        left_panel_widget = QWidget()
+        self.left_panel_layout = QVBoxLayout(left_panel_widget)
+        self._build_left_panel()
+        self.left_panel_layout.addWidget(self.image_display)
+        self.left_panel_layout.addWidget(self.frame_slider)
+        self.left_panel_layout.addWidget(self.canvas)
 
+        # -------- RIGHT PANEL --------
+        self.right_panel_layout = QVBoxLayout()
+        right_panel_widget_content = QWidget()
+        right_panel_widget_content.setLayout(self.right_panel_layout)
+        self.right_panel_layout.addWidget(self._build_trace_group())
+        self.right_panel_layout.addWidget(self._build_peak_group())
+        self.right_panel_layout.addWidget(self._build_periodicity_group())
+        self.right_panel_layout.addWidget(self._build_synchronicity_group())
+        self.right_panel_layout.addStretch()
+        self.right_panel_layout.addWidget(self._build_save_group())
+
+        # --- SCROLL AREA SETUP ---
+        scroll_area = QScrollArea()
+        scroll_area.setWidgetResizable(True)  # allows vertical resizing
+        scroll_area.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        scroll_area.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        scroll_area.setWidget(right_panel_widget_content)
+
+        # fix the width of the right panel to its content
+        width = right_panel_widget_content.sizeHint().width()
+        right_panel_widget_content.setMinimumWidth(width)
+        right_panel_widget_content.setMaximumWidth(width)
+        scroll_area.updateGeometry()
+
+        splitter = QSplitter(Qt.Horizontal)
+        splitter.addWidget(left_panel_widget)
+        splitter.addWidget(scroll_area)
+
+        # Set initial splitter sizes
+        initial_right_width = right_panel_widget_content.sizeHint().width()
+        splitter.setSizes([700, initial_right_width])
+
+        # Add splitter to main layout
+        main_layout.addWidget(splitter)
+
+        # set data
+        self.image_display.display_dask_frame(
+            self.frames[0, self.display_channel, :, :]
+        )  # TCYX format
+        self.image_display.set_rois(self.rois)
+        self.update_intensity_trace()
+
+        # Connecting buttons and signals
+        self.frame_slider.valueChanged.connect(self.on_slider_moved)
+        self.show_raw_btn.clicked.connect(self.show_raw_traces)
+        self.show_detrended_btn.clicked.connect(self.show_detrended_traces)
+        self.image_display.roiSelected.connect(self.roi_selected)
+        self.find_peaks_btn.clicked.connect(self._start_peak_worker)
+        self.periodicity_button.clicked.connect(self._start_periodicity_worker)
+        self.periodic_display_checkbox.stateChanged.connect(
+            self._periodic_cell_highlight
+        )
+        self.periodicity_toggle.toggled.connect(self._periodic_cell_highlight)
+        self.show_neighbour_btn.clicked.connect(self._start_neighbours_worker)
+        self.calculate_synchronous_btn.clicked.connect(self._start_synchronicity_worker)
+
+    def _build_left_panel(self) -> None:
+        """Creates the frame display, the frame slider and the intensity plot."""
         # Image display
         self.image_display = ImageDisplay()
         self.image_display.setMinimumSize(400, 400)
-        left_panel.addWidget(self.image_display)
 
         # Video slider
         self.frame_slider = QSlider(Qt.Horizontal)
         self.frame_slider.setMinimum(0)
         self.frame_slider.setMaximum(self.frames.shape[0] - 1)  # Use -1 for index
-        left_panel.addWidget(self.frame_slider)
 
         # Intensity plot
         self.fig = Figure(figsize=(4, 2))
         self.canvas = FigureCanvas(self.fig)
-        left_panel.addWidget(self.canvas)
         self.ax = self.fig.add_subplot(111)
 
-        # -------- RIGHT PANEL --------
-        right_panel = QVBoxLayout()
-
-        #region Trace Detrending Group
+    def _build_trace_group(self) -> CollapsibleBox:
         trace_group = CollapsibleBox("Trace Detrending")
 
         # Container widget for the form layout
@@ -333,26 +447,26 @@ class MainWindow(QMainWindow):
         trace_layout.setSpacing(5)
 
         # Sinc filter window
-        self.sinc_filter_spin = QDoubleSpinBox()
-        self.sinc_filter_spin.setDecimals(2)
         sinc_max = self.frames.shape[0] * self.analysis_output.frame_interval
-        self.sinc_filter_spin.setMinimum(1)
-        self.sinc_filter_spin.setMaximum(sinc_max)
-        self.sinc_filter_spin.setValue(
-            int(self.frames.shape[0] * self.analysis_output.frame_interval / 2)
+        self.sinc_filter_spin = _double_spin_box(
+            decimals=2, minimum=1, maximum=sinc_max, value=int(sinc_max / 2)
         )
         trace_layout.addRow("Sinc Filter Window [s]:", self.sinc_filter_spin)
 
         # Frame interval auto-detected
-        self.frame_interval_value = QLabel(f"{self.analysis_output.frame_interval:.2f}")
-        trace_layout.addRow("Frame Interval Auto-Detected [s]:", self.frame_interval_value)
+        self.frame_interval_value = QLabel(f"{self.analysis_output.frame_interval:.4g}")
+        trace_layout.addRow(
+            "Frame Interval Auto-Detected [s]:", self.frame_interval_value
+        )
 
         # Frame interval spin
-        self.frame_interval_spin = QDoubleSpinBox()
-        self.frame_interval_spin.setDecimals(2)
-        self.frame_interval_spin.setMinimum(0.01)
-        self.frame_interval_spin.setMaximum(1000)
-        self.frame_interval_spin.setValue(self.analysis_output.frame_interval)
+        # the box shows the frame interval rounded, see _typed_frame_interval
+        self.frame_interval_spin = _double_spin_box(
+            decimals=FRAME_INTERVAL_DECIMALS,
+            minimum=10**-FRAME_INTERVAL_DECIMALS,
+            maximum=1000,
+            value=self.analysis_output.frame_interval,
+        )
         trace_layout.addRow("Frame Interval [s]:", self.frame_interval_spin)
 
         # Video duration
@@ -373,10 +487,9 @@ class MainWindow(QMainWindow):
         trace_layout.addRow(btn_container)
 
         trace_group.add_widget(form_container)
-        right_panel.addWidget(trace_group)
-        #endregion
+        return trace_group
 
-        #region Peak Identification Group
+    def _build_peak_group(self) -> CollapsibleBox:
         peak_group = CollapsibleBox("Peak Identification")
 
         # Container widget for the QFormLayout
@@ -386,35 +499,27 @@ class MainWindow(QMainWindow):
         peak_layout.setSpacing(5)
 
         # Peak Min Width
-        self.peak_min_width_spin = QDoubleSpinBox()
-        self.peak_min_width_spin.setDecimals(2)
-        self.peak_min_width_spin.setMinimum(1)
-        self.peak_min_width_spin.setMaximum(1000)
-        self.peak_min_width_spin.setValue(1.0)
+        self.peak_min_width_spin = _double_spin_box(
+            decimals=2, minimum=1, maximum=1000, value=1.0
+        )
         peak_layout.addRow("Peak Min Width [s]:", self.peak_min_width_spin)
 
         # Peak Max Width
-        self.peak_max_width_spin = QDoubleSpinBox()
-        self.peak_max_width_spin.setDecimals(2)
-        self.peak_max_width_spin.setMinimum(0)
-        self.peak_max_width_spin.setMaximum(1000)
-        self.peak_max_width_spin.setValue(80.0)
+        self.peak_max_width_spin = _double_spin_box(
+            decimals=2, minimum=0, maximum=1000, value=80.0
+        )
         peak_layout.addRow("Peak Max Width [s]:", self.peak_max_width_spin)
 
         # Peak Min Height
-        self.peak_min_height_spin = QDoubleSpinBox()
-        self.peak_min_height_spin.setDecimals(0)
-        self.peak_min_height_spin.setMinimum(0)
-        self.peak_min_height_spin.setMaximum(65535)
-        self.peak_min_height_spin.setValue(800)
+        self.peak_min_height_spin = _double_spin_box(
+            decimals=0, minimum=0, maximum=65535, value=800
+        )
         peak_layout.addRow("Peak Min Height [au]:", self.peak_min_height_spin)
 
         # Peak Prominence
-        self.peak_prominence_spin = QDoubleSpinBox()
-        self.peak_prominence_spin.setDecimals(0)
-        self.peak_prominence_spin.setMinimum(0)
-        self.peak_prominence_spin.setMaximum(65535)
-        self.peak_prominence_spin.setValue(1500)
+        self.peak_prominence_spin = _double_spin_box(
+            decimals=0, minimum=0, maximum=65535, value=1500
+        )
         peak_layout.addRow("Peak Prominence [au]:", self.peak_prominence_spin)
 
         # Find Peaks Button
@@ -431,10 +536,9 @@ class MainWindow(QMainWindow):
 
         # Add the form container to the collapsible box
         peak_group.add_widget(form_container)
-        right_panel.addWidget(peak_group)
-        #endregion
+        return peak_group
 
-        #region Periodicity
+    def _build_periodicity_group(self) -> CollapsibleBox:
         periodicity_group = CollapsibleBox("Periodic Cells")
 
         # Container widget for the QFormLayout
@@ -463,7 +567,9 @@ class MainWindow(QMainWindow):
         # Row 1: STD threshold input + labels
         self.periodicity_threshold_std_LineEdit = QLineEdit()
         self.periodicity_threshold_std_LineEdit.setMinimumWidth(40)
-        self.periodicity_threshold_std_LineEdit.setValidator(QDoubleValidator(0.0, 1000.0, 2, self))
+        self.periodicity_threshold_std_LineEdit.setValidator(
+            DecimalValidator(0.0, 1000.0, 2, self)
+        )
         self.periodicity_threshold_std_LineEdit.setText("15.0")
 
         self.std_cutoff_value_label = QLabel("cutoff: —s")
@@ -483,7 +589,9 @@ class MainWindow(QMainWindow):
         # Row 2: CoV threshold input + labels
         self.periodicity_threshold_cov_LineEdit = QLineEdit()
         self.periodicity_threshold_cov_LineEdit.setMinimumWidth(40)
-        self.periodicity_threshold_cov_LineEdit.setValidator(QDoubleValidator(0.0, 1.0, 2, self))
+        self.periodicity_threshold_cov_LineEdit.setValidator(
+            DecimalValidator(0.0, 1.0, 2, self)
+        )
         self.periodicity_threshold_cov_LineEdit.setText("0.20")
 
         self.cov_cutoff_value_label = QLabel("cutoff: —")
@@ -533,12 +641,9 @@ class MainWindow(QMainWindow):
 
         # Add the form container to the collapsible box
         periodicity_group.add_widget(form_container)
+        return periodicity_group
 
-        # Add the collapsible box to the panel
-        right_panel.addWidget(periodicity_group)
-        #endregion 
-
-        #region Synchronicity
+    def _build_synchronicity_group(self) -> CollapsibleBox:
         self.synch_group = CollapsibleBox("Synchronicity Analysis")
 
         # Container widget for the QFormLayout
@@ -548,19 +653,15 @@ class MainWindow(QMainWindow):
         synch_layout.setSpacing(5)
 
         # Neighbour Distance input
-        self.neighbour_distance_spin = QDoubleSpinBox()
-        self.neighbour_distance_spin.setDecimals(2)
-        self.neighbour_distance_spin.setMinimum(0)
-        self.neighbour_distance_spin.setMaximum(100)
-        self.neighbour_distance_spin.setValue(10.0)  # default value
+        self.neighbour_distance_spin = _double_spin_box(
+            decimals=2, minimum=0, maximum=100, value=10.0
+        )
         synch_layout.addRow("Neighbour Distance [µm]:", self.neighbour_distance_spin)
 
         # Time Window input
-        self.time_window_spin = QDoubleSpinBox()
-        self.time_window_spin.setDecimals(2)
-        self.time_window_spin.setMinimum(0)
-        self.time_window_spin.setMaximum(100)
-        self.time_window_spin.setValue(10.0)  # default value
+        self.time_window_spin = _double_spin_box(
+            decimals=2, minimum=0, maximum=100, value=10.0
+        )
         synch_layout.addRow("Time Window [s]:", self.time_window_spin)
 
         # Action buttons
@@ -583,15 +684,9 @@ class MainWindow(QMainWindow):
 
         # Add the form container to the collapsible box
         self.synch_group.add_widget(form_container)
+        return self.synch_group
 
-        # Add the collapsible box to the panel
-        right_panel.addWidget(self.synch_group)
-        #endregion
-
-        right_panel.addStretch()
-
-
-        # Saving
+    def _build_save_group(self) -> QGroupBox:
         save_group = QGroupBox("Saving")
         save_layout = QVBoxLayout()
         save_row_layout = QHBoxLayout()
@@ -606,76 +701,7 @@ class MainWindow(QMainWindow):
 
         save_layout.addLayout(save_row_layout)
         save_group.setLayout(save_layout)
-        right_panel.addWidget(save_group)
-
-        # --- LEFT PANEL ---
-        left_panel_widget = QWidget()
-        self.left_panel_layout = QVBoxLayout(left_panel_widget) 
-
-        # Add widgets to left panel
-        self.left_panel_layout.addWidget(self.image_display)
-        self.left_panel_layout.addWidget(self.frame_slider)
-        self.left_panel_layout.addWidget(self.canvas)
-
-        # --- RIGHT PANEL ---
-        self.right_panel_layout = QVBoxLayout() 
-        right_panel_widget_content = QWidget()
-        right_panel_widget_content.setLayout(self.right_panel_layout)
-
-        # Add your collapsible boxes and groups to the right_panel_layout here
-        # For example:
-        self.right_panel_layout.addWidget(trace_group)
-        self.right_panel_layout.addWidget(peak_group)
-        self.right_panel_layout.addWidget(periodicity_group)
-        self.right_panel_layout.addWidget(self.synch_group)
-        self.right_panel_layout.addStretch()
-        self.right_panel_layout.addWidget(save_group)
-
-        # --- SCROLL AREA SETUP ---
-        scroll_area = QScrollArea()
-        scroll_area.setWidgetResizable(True)  # allows vertical resizing
-        scroll_area.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
-        scroll_area.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        scroll_area.setWidget(right_panel_widget_content)
-
-        # Function to dynamically update the width based on content
-        def update_right_panel_width():
-            width = right_panel_widget_content.sizeHint().width()
-            right_panel_widget_content.setMinimumWidth(width)
-            right_panel_widget_content.setMaximumWidth(width)
-            scroll_area.updateGeometry()
-
-        # Initial call
-        update_right_panel_width()
-
-        splitter = QSplitter(Qt.Horizontal)
-        splitter.addWidget(left_panel_widget)
-        splitter.addWidget(scroll_area)
-
-        # Set initial splitter sizes
-        initial_right_width = right_panel_widget_content.sizeHint().width()
-        splitter.setSizes([700, initial_right_width])
-
-        # Add splitter to main layout
-        main_layout.addWidget(splitter)
-
-
-        # set data
-        self.image_display.display_dask_frame(self.frames[0, 0, :, :])  # TCYX format
-        self.image_display.set_rois(self.rois)
-        self.update_intensity_trace()
-
-        # Connecting buttons and signals
-        self.frame_slider.valueChanged.connect(self.on_slider_moved)
-        self.show_raw_btn.clicked.connect(self.show_raw_traces)
-        self.show_detrended_btn.clicked.connect(self.show_detrended_traces)
-        self.image_display.roiSelected.connect(self.roi_selected)
-        self.find_peaks_btn.clicked.connect(self._start_peak_worker)
-        self.periodicity_button.clicked.connect(self._start_periodicity_worker)
-        self.periodic_display_checkbox.stateChanged.connect(self._periodic_cell_highlight)
-        self.periodicity_toggle.toggled.connect(self._periodic_cell_highlight)
-        self.show_neighbour_btn.clicked.connect(self._start_neighbours_worker)
-        self.calculate_synchronous_btn.clicked.connect(self._start_synchronicity_worker)
+        return save_group
 
     def _create_menu_bar(self):
         self.menu_bar = self.menuBar()
@@ -696,8 +722,12 @@ class MainWindow(QMainWindow):
 
     def on_slider_moved(self, idx):
         self.current_frame = idx
-        self.image_display.display_dask_frame(self.frames[self.current_frame, 0, :, :])
-        self.update_intensity_trace()
+        self.image_display.display_dask_frame(
+            self.frames[self.current_frame, self.display_channel, :, :]
+        )
+        # only the frame marker moves, so the trace is not plotted again
+        self.frame_marker.set_xdata([idx, idx])
+        self.canvas.draw_idle()
 
     def roi_selected(self, idx):
         self.selected_roi = idx
@@ -717,7 +747,7 @@ class MainWindow(QMainWindow):
                 )
                 self.ax.set_ylabel("Detrended Intensity")
             except Exception as e:
-                print(f"Error plotting detrended intensities: {e}")
+                logger.error(f"Error plotting detrended intensities: {e}")
         else:
             self.ax.plot(
                 self.intensities[:, self.selected_roi],
@@ -726,7 +756,7 @@ class MainWindow(QMainWindow):
             )
             self.ax.set_ylabel("Raw Intensity")
 
-        if hasattr(self, "peaks") and self.peaks is not None:
+        if self.peaks is not None:
             peak_indices = np.where(self.peaks[:, self.selected_roi] == 1)[0]
             self.ax.plot(
                 peak_indices,
@@ -739,7 +769,9 @@ class MainWindow(QMainWindow):
                 markersize=4,
             )
 
-        self.ax.axvline(self.current_frame, color="k", linestyle="--")
+        self.frame_marker = self.ax.axvline(
+            self.current_frame, color="k", linestyle="--"
+        )
         self.ax.set_xlabel("Frame")
         self.ax.legend()
         self.canvas.draw()
@@ -748,9 +780,20 @@ class MainWindow(QMainWindow):
         self.show_detrended = False
         self.update_intensity_trace()
 
+    def _typed_frame_interval(self) -> float:
+        """
+        Returns the frame interval of the spin box. The box can only show it rounded, so
+        as long as the user has not changed it, the exact frame interval is returned.
+        """
+        typed = self.frame_interval_spin.value()
+        exact = self.analysis_output.frame_interval
+        if typed == round(exact, FRAME_INTERVAL_DECIMALS):
+            return exact
+        return typed
+
     def show_detrended_traces(self):
         sinc_value = self.sinc_filter_spin.value()
-        frame_interval = self.frame_interval_spin.value()
+        frame_interval = self._typed_frame_interval()
         # If needed, recompute
         needs_recompute = (
             self.detrended_intensities is None
@@ -758,8 +801,8 @@ class MainWindow(QMainWindow):
             or self.analysis_output.frame_interval != frame_interval
         )
         if needs_recompute:
-            # Optionally show a progress bar or message here
-            # start computing
+            if self._detrending:
+                return  # a detrend is already running and will update the trace
             self._start_detrend_worker(sinc_value, frame_interval)
         else:
             self.show_detrended = True
@@ -768,15 +811,19 @@ class MainWindow(QMainWindow):
     def _periodic_cell_highlight(self):
         if self.periodic_display_checkbox.isChecked():
             if self.analysis_output is not None:
-                if self.periodicity_toggle.value() == "STD" and self.experimental_stds is not None:
+                if (
+                    self.periodicity_toggle.value() == "STD"
+                    and self.experimental_stds is not None
+                ):
                     periodic_indices = np.where(
-                        self.experimental_stds
-                        < self.analysis_output.std_cutoff
+                        self.experimental_stds < self.analysis_output.std_cutoff
                     )[0].tolist()
-                elif self.periodicity_toggle.value() == "CoV" and self.experimental_covs is not None:
+                elif (
+                    self.periodicity_toggle.value() == "CoV"
+                    and self.experimental_covs is not None
+                ):
                     periodic_indices = np.where(
-                        self.experimental_covs
-                        < self.analysis_output.cov_cutoff
+                        self.experimental_covs < self.analysis_output.cov_cutoff
                     )[0].tolist()
                 else:
                     periodic_indices = []
@@ -785,31 +832,32 @@ class MainWindow(QMainWindow):
             self.image_display.clear_roi_centers()
 
     def _start_detrend_worker(self, sinc_value, frame_interval):
-        self.detrend_thread = QThread()
+        self._detrending = True
+        # the window the traces are detrended with, it may be changed while this runs
+        self._detrend_sinc_window = sinc_value
+        if frame_interval != self.analysis_output.frame_interval:
+            self.analysis_output.frame_interval_source = "parameter"
         self.analysis_output.frame_interval = frame_interval
-        self.detrend_worker = DetrendWorker(
-            self.intensities, sinc_value, self.analysis_output.frame_interval
+        self.detrend_worker = FunctionWorker(
+            detrend_with_sinc_filter,
+            signals=self.intensities,
+            cutoff_period=sinc_value,
+            sampling_interval=self.analysis_output.frame_interval,
+            description="Detrending",
         )
-        self.detrend_worker.moveToThread(self.detrend_thread)
-        self.detrend_thread.started.connect(self.detrend_worker.run)
-        self.detrend_worker.finished.connect(self._detrend_done)
-        self.detrend_worker.error.connect(self._detrend_error)
-        self.detrend_worker.finished.connect(self.detrend_thread.quit)
-        self.detrend_worker.finished.connect(self.detrend_worker.deleteLater)
-        self.detrend_thread.finished.connect(self.detrend_thread.deleteLater)
-        self.detrend_thread.start()
+        start_worker(self, self.detrend_worker, self._detrend_done, self._detrend_error)
 
     def _detrend_done(self, detrended):
+        self._detrending = False
         self.detrended_intensities = detrended
-        self.analysis_params.sinc_filter_window = self.sinc_filter_spin.value()
-        self.last_sinc_window = self.sinc_filter_spin.value()
+        self.analysis_params.sinc_filter_window = self._detrend_sinc_window
+        self.last_sinc_window = self._detrend_sinc_window
         # Optionally hide progress bar or message here
         self.show_detrended = True
         self.update_intensity_trace()
 
     def _detrend_error(self, error):
-        from PySide6.QtWidgets import QMessageBox
-
+        self._detrending = False
         QMessageBox.critical(self, "Error", f"Detrending failed: {error}")
 
     def _start_peak_worker(self):
@@ -821,43 +869,35 @@ class MainWindow(QMainWindow):
             )
             return
 
-        frame_interval = self.analysis_output.frame_interval
-
         # update analysis params
         self.analysis_params.peak_min_width = self.peak_min_width_spin.value()
         self.analysis_params.peak_max_width = self.peak_max_width_spin.value()
         self.analysis_params.peak_prominence = self.peak_prominence_spin.value()
         self.analysis_params.peak_min_height = self.peak_min_height_spin.value()
 
-        # Convert time-based spinboxes to frame units
-        min_width = int(self.peak_min_width_spin.value() / frame_interval)
-        max_width = int(self.peak_max_width_spin.value() / frame_interval)
+        # Convert time-based spinboxes to frame units, the same way as the pipeline
+        min_width, max_width = peak_widths_in_frames(
+            self.analysis_params, self.analysis_output
+        )
 
         self.find_peaks_btn.setEnabled(False)  # Prevent repeat clicks
 
         # Launch async worker
-        self.peak_thread = QThread()
-        self.peak_worker = PeakDetectionWorker(
-            detrended_traces=self.detrended_intensities,
-            min_width=min_width,
-            max_width=max_width,
-            analysis_params=self.analysis_params,
-            analysis_output=self.analysis_output,
+        self.peak_worker = FunctionWorker(
+            do_peak_analysis,
+            self.detrended_intensities,
+            min_width,
+            max_width,
+            self.analysis_params,
+            self.analysis_output,
+            description="Peak Detection",
         )
-        self.peak_worker.moveToThread(self.peak_thread)
-        self.peak_thread.started.connect(self.peak_worker.run)
-        self.peak_worker.finished.connect(self._peaks_detected)
-        self.peak_worker.error.connect(self._peak_error)
-        self.peak_worker.finished.connect(self.peak_thread.quit)
-        self.peak_worker.finished.connect(self.peak_worker.deleteLater)
-        self.peak_thread.finished.connect(self.peak_thread.deleteLater)
-        self.peak_thread.start()
+        start_worker(self, self.peak_worker, self._peaks_detected, self._peak_error)
 
     def _peaks_detected(self, result):
-        self.peaks = result[0]
-        self.analysis_output = result[1]
+        self.peaks, _, _, self.analysis_output = result
         self.find_peaks_btn.setEnabled(True)
- 
+
         percentage_four_peaks = (
             self.analysis_output.cells_four_peaks
             / self.analysis_output.number_of_cells
@@ -883,6 +923,16 @@ class MainWindow(QMainWindow):
             )
             return
 
+        for line_edit, name in (
+            (self.periodicity_threshold_std_LineEdit, "STD threshold (0 to 1000)"),
+            (self.periodicity_threshold_cov_LineEdit, "CoV threshold (0 to 1)"),
+        ):
+            if not line_edit.hasAcceptableInput():
+                QMessageBox.warning(
+                    self, "Invalid Input", f"Please enter a number for the {name}."
+                )
+                return
+
         self.analysis_params.periodicity_method = (
             "cutoff" if self.rb_periodicity_cutoff.isChecked() else "quantile"
         )
@@ -894,26 +944,27 @@ class MainWindow(QMainWindow):
         )
 
         self.periodicity_button.setEnabled(False)
-        self.periodicity_thread = QThread()
-        self.periodicity_worker = PeriodicCellWorker(
-            peaks=self.peaks,
-            analysis_params=self.analysis_params,
-            analysis_output=self.analysis_output,
+        self.periodicity_worker = FunctionWorker(
+            _find_periodic_cells,
+            self.peaks,
+            self.analysis_params,
+            self.analysis_output,
+            description="Periodicity Analysis",
         )
-        self.periodicity_worker.moveToThread(self.periodicity_thread)
-        self.periodicity_thread.started.connect(self.periodicity_worker.run)
-        self.periodicity_worker.finished.connect(self._periodicity_done)
-        self.periodicity_worker.error.connect(self._periodicity_error)
-        self.periodicity_worker.finished.connect(self.periodicity_thread.quit)
-        self.periodicity_worker.finished.connect(self.periodicity_worker.deleteLater)
-        self.periodicity_thread.finished.connect(self.periodicity_thread.deleteLater)
-        self.periodicity_thread.start()
+        start_worker(
+            self,
+            self.periodicity_worker,
+            self._periodicity_done,
+            self._periodicity_error,
+        )
 
-    def _periodicity_done(self, analysis_output, stds, covs, roi_dataframe):
-        self.analysis_output = analysis_output
-        self.experimental_stds = stds
-        self.experimental_covs = covs
-        self.roi_dataframe = roi_dataframe
+    def _periodicity_done(self, results):
+        (
+            self.analysis_output,
+            self.experimental_stds,
+            self.experimental_covs,
+            self.roi_dataframe,
+        ) = results
 
         # Update the labels with periodicity cutoffs and quantiles
         self.cov_cutoff_value_label.setText(
@@ -930,25 +981,12 @@ class MainWindow(QMainWindow):
         )
 
         # Update the periodicity percentage labels
+        n_cells = self.analysis_output.number_of_cells
         std_periodic_per_all = round(
-            (
-                (
-                    self.analysis_output.experimental_below_std
-                    / self.analysis_output.number_of_cells
-                )
-                * 100
-            ),
-            1,
+            self.analysis_output.experimental_below_std / n_cells * 100, 1
         )
         cov_periodic_per_all = round(
-            (
-                (
-                    self.analysis_output.experimental_below_cov
-                    / self.analysis_output.number_of_cells
-                )
-                * 100
-            ),
-            1,
+            self.analysis_output.experimental_below_cov / n_cells * 100, 1
         )
         self.std_periodic_per_active_label.setText(
             f"Cells below STD cutoff: {std_periodic_per_all}%"
@@ -975,25 +1013,22 @@ class MainWindow(QMainWindow):
             return
 
         self.show_neighbour_btn.setEnabled(False)
-        self.neighbours_thread = QThread()
-        self.analysis_params.neighbour_distance = self.neighbour_distance_spin.value()
-        neighbour_tolerance_pixels = int(self.analysis_params.neighbour_distance / self.analysis_output.pixel_interval_y)
-        self.neighbours_worker = AdjacencyMatrixWorker(
-            masks=self.masks,
-            neighbour_tolerance_pixels=neighbour_tolerance_pixels,
+        self.analysis_params.neighbour_tolerance = self.neighbour_distance_spin.value()
+        neighbour_tolerance_pixels = neighbour_tolerance_in_pixels(
+            self.analysis_params, self.analysis_output
         )
-        self.neighbours_worker.moveToThread(self.neighbours_thread)
-        self.neighbours_thread.started.connect(self.neighbours_worker.run)
-        self.neighbours_worker.finished.connect(self._neighbours_done)
-        self.neighbours_worker.error.connect(self._neighbours_error)
-        self.neighbours_worker.finished.connect(self.neighbours_thread.quit)
-        self.neighbours_worker.finished.connect(self.neighbours_worker.deleteLater)
-        self.neighbours_thread.finished.connect(self.neighbours_thread.deleteLater)
-        self.neighbours_thread.start()
-    
-    def _neighbours_done(self, adjacency_matrix, shortest_path_matrix):
-        self.adjacency_matrix = adjacency_matrix
-        self.shortest_path_matrix = shortest_path_matrix
+        self.neighbours_worker = FunctionWorker(
+            get_adjacency_matrix,
+            self.masks,
+            neighbour_tolerance=neighbour_tolerance_pixels,
+            description="Neighbourhood Analysis",
+        )
+        start_worker(
+            self, self.neighbours_worker, self._neighbours_done, self._neighbours_error
+        )
+
+    def _neighbours_done(self, results):
+        self.adjacency_matrix, self.shortest_path_matrix = results
 
         # Highlight neighbours of the selected ROI
         self.image_display.draw_roi_connections(self.shortest_path_matrix)
@@ -1007,30 +1042,33 @@ class MainWindow(QMainWindow):
     def _start_synchronicity_worker(self):
         if self.peaks is None:
             QMessageBox.warning(
-                self, "Missing Data", "Run peak detection before calculating synchronicity."
+                self,
+                "Missing Data",
+                "Run peak detection before calculating synchronicity.",
             )
             return
-        if not hasattr(self, 'adjacency_matrix'):
-            QMessageBox.warning(self, "No Neighbour Data", "Please find neighbours first.")
+        if self.adjacency_matrix is None:
+            QMessageBox.warning(
+                self, "No Neighbour Data", "Please find neighbours first."
+            )
             return
 
         self.calculate_synchronous_btn.setEnabled(False)
-        self.synchronicity_thread = QThread()
         self.analysis_params.time_window = self.time_window_spin.value()
-        self.synchronicity_worker = SynchronicityWorker(
-            self.analysis_output,
-            self.analysis_params,
+        self.synchronicity_worker = FunctionWorker(
+            calculate_synchronicity,
+            self.shortest_path_matrix,
             self.peaks,
-            self.shortest_path_matrix
+            self.analysis_params,
+            self.analysis_output,
+            description="Synchronicity Analysis",
         )
-        self.synchronicity_worker.moveToThread(self.synchronicity_thread)
-        self.synchronicity_thread.started.connect(self.synchronicity_worker.run)
-        self.synchronicity_worker.finished.connect(self._synchronicity_done)
-        self.synchronicity_worker.error.connect(self._synchronicity_error)
-        self.synchronicity_worker.finished.connect(self.synchronicity_thread.quit)
-        self.synchronicity_worker.finished.connect(self.synchronicity_worker.deleteLater)
-        self.synchronicity_thread.finished.connect(self.synchronicity_thread.deleteLater)
-        self.synchronicity_thread.start()
+        start_worker(
+            self,
+            self.synchronicity_worker,
+            self._synchronicity_done,
+            self._synchronicity_error,
+        )
 
     def _synchronicity_done(self, results):
         self.analysis_output = results[0]
@@ -1044,15 +1082,24 @@ class MainWindow(QMainWindow):
         self.calculate_synchronous_btn.setEnabled(True)
 
     def _synchronicity_error(self, error):
-        tb_str = "".join(traceback.format_exception(type(error), error, error.__traceback__))
+        tb_str = "".join(
+            traceback.format_exception(type(error), error, error.__traceback__)
+        )
         QMessageBox.critical(self, "Error", f"Synchronicity analysis failed: {tb_str}")
         self.calculate_synchronous_btn.setEnabled(True)
 
     def _save_analysis_results(self):
+        if self.true_synchronous_peaks_matrix is None or self.experimental_stds is None:
+            QMessageBox.warning(
+                self,
+                "Missing Data",
+                "Find the periodic cells and calculate the synchronicity before saving.",
+            )
+            return
         self.save_btn.setEnabled(False)
-        self.analysis_save_thread = QThread()
-        self.analysis_worker = AnalysisSaveWorker(
-            tproj=self.tproj,
+        self.analysis_worker = FunctionWorker(
+            _save_with_projection,
+            tproj_path=self.analysis_output.tproj_path,
             masks=self.masks,
             synchronous_peaks_matrix=self.true_synchronous_peaks_matrix,
             analysis_output=self.analysis_output,
@@ -1064,21 +1111,13 @@ class MainWindow(QMainWindow):
             covs=self.experimental_covs,
             roi_dataframe=self.roi_dataframe,
             overwrite=self.overwrite_checkbox.isChecked(),
+            description="Saving",
         )
-        self.analysis_worker.moveToThread(self.analysis_save_thread)
-
-        self.analysis_save_thread.started.connect(self.analysis_worker.run)
-        self.analysis_worker.finished.connect(self.on_save_finished)
-        self.analysis_worker.error.connect(self.on_save_error)
-        self.analysis_worker.finished.connect(self.analysis_save_thread.quit)
-        self.analysis_worker.finished.connect(self.analysis_worker.deleteLater)
-        self.analysis_save_thread.finished.connect(
-            self.analysis_save_thread.deleteLater
+        start_worker(
+            self, self.analysis_worker, self.on_save_finished, self.on_save_error
         )
 
-        self.analysis_save_thread.start()
-
-    def on_save_finished(self, _: str):
+    def on_save_finished(self, _):
         self.save_btn.setEnabled(True)
         QMessageBox.information(
             self, "Save Complete", "Analysis results saved successfully."
@@ -1088,7 +1127,21 @@ class MainWindow(QMainWindow):
         self.save_btn.setEnabled(True)
         QMessageBox.critical(self, "Save Error", str(e))
 
+    def closeEvent(self, event):
+        if defer_close_while_running(self, event):
+            return
+        # a running QThread that is destroyed with its window aborts the application
+        stop_workers(self)
+        super().closeEvent(event)
+
     def _on_new_analysis(self):
+        if workers_running(self):
+            QMessageBox.information(
+                self,
+                "Analysis Running",
+                "Please wait until the running analysis step has finished.",
+            )
+            return
         if self.app_controller:
             self.app_controller.restart()
 

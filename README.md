@@ -43,7 +43,7 @@ uv pip install 'pykrait[gui]'
 python -m venv .venv
 source .venv/bin/activate           # Windows: .venv\Scripts\activate
 pip install --upgrade pip
-pip install pykrait
+pip install "pykrait[gui]"
 ```
 
 
@@ -79,6 +79,8 @@ concat_analysis_files("/path/to/videos", filetype="output")
 
 This produces one `Analysis_<video>/` directory per video and an `analysis_output_overview.csv` at the root of the folder.
 
+To analyze videos in subfolders, pass `recursive=True`; to analyze only some of the acquisitions, pass `filter_string` / `exclude_string` (e.g. `filter_string="*_timeseries.czi"`, where a pattern with `*`, `?` or `[]` matches the whole file name and anything else matches as a substring).
+
 ## Example Notebooks
 
 | Scenario | Notebook |
@@ -92,14 +94,15 @@ This produces one `Analysis_<video>/` directory per video and an `analysis_outpu
 For each video, pyKrait runs the following stages:
 
 1. **Load** — lazy `Dask` array via `bioio` (`.czi`, `.tif`, `.tiff`).
-2. **Project** — STD or SUM projection across time, with optional CLAHE.
-3. **Segment** — Cellpose (`cpsam` by default, or a custom model path).
-4. **Extract** — per-cell mean intensity per frame, computed lazily on Dask.
-5. **Detrend** — Blackman-windowed sinc filter (cf. pyBOAT).
-6. **Detect peaks** — `scipy.signal.find_peaks` with width / height / prominence thresholds.
-7. **Periodicity** — STD and CoV of inter-peak intervals, scored against a shuffled-peaks null.
-8. **Adjacency** — neighbour graph from segmented masks (kernel-based proximity).
-9. **Synchronicity** — co-firing peaks within a time window and topological distance, z-scored against label-shuffled controls.
+2. **Correct motion** *(optional, off by default)* — align every frame to a template, either by a rigid translation or by a mesh-based / polynomial optical-flow warp.
+3. **Project** — STD or SUM projection across time, with optional CLAHE.
+4. **Segment** — Cellpose (`cpsam` by default, or a custom model path).
+5. **Extract** — per-cell mean intensity per frame, computed lazily on Dask.
+6. **Detrend** — Blackman-windowed sinc filter (cf. pyBOAT).
+7. **Detect peaks** — `scipy.signal.find_peaks` with width / height / prominence thresholds.
+8. **Periodicity** — STD and CoV of inter-peak intervals, scored against a shuffled-peaks null.
+9. **Adjacency** — neighbour graph from segmented masks (kernel-based proximity).
+10. **Synchronicity** — co-firing peaks within a time window and topological distance, z-scored against label-shuffled controls.
 
 ## Documentation
 

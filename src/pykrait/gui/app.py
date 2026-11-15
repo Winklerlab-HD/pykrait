@@ -1,3 +1,4 @@
+import logging
 import sys
 import os
 import warnings
@@ -8,15 +9,18 @@ from pykrait.gui.fileselection import FileSelectionWindow
 from pykrait.gui.mainwindow import MainWindow
 from pykrait.io.files import get_pykrait_version
 
+logger = logging.getLogger(__name__)
+
+
 def warning_no_source_line(message, category, filename, lineno, file=None, line=None):
     return f"{filename}:{lineno}: {category.__name__}: {message}\n"
 
+
 class AppController:
     def __init__(self):
-
         # format warnings to not print the source line every time
         warnings.formatwarning = warning_no_source_line
-        
+
         self.app = QApplication(sys.argv)
 
         # Loading icon from resources
@@ -25,7 +29,6 @@ class AppController:
             from importlib.resources import files
 
             icon_path = files("pykrait.gui.resources").joinpath("logo.png")
-            os.path.exists(icon_path)
         except Exception:
             icon_path = os.path.abspath(
                 os.path.join(
@@ -36,28 +39,21 @@ class AppController:
                     "logo.png",
                 )
             )
-            os.path.exists(icon_path)
         if os.path.exists(icon_path):
-            appIcon.addFile(str(icon_path), QSize(16, 16))
-            appIcon.addFile(str(icon_path), QSize(24, 24))
-            appIcon.addFile(str(icon_path), QSize(32, 32))
-            appIcon.addFile(str(icon_path), QSize(48, 48))
-            appIcon.addFile(str(icon_path), QSize(64, 64))
-            appIcon.addFile(str(icon_path), QSize(256, 256))
+            for size in (16, 24, 32, 48, 64, 256):
+                appIcon.addFile(str(icon_path), QSize(size, size))
             self.app.setWindowIcon(appIcon)
         else:
-            print(f"Warning: Icon file not found at {icon_path}")
+            logger.warning(f"Warning: Icon file not found at {icon_path}")
 
         # Set application name and version
         self.app.setApplicationName("pyKrait")
         version = get_pykrait_version()
         if version is not None:
             self.app.setApplicationVersion(version)
-        self.file_selection = FileSelectionWindow()
-        self.file_selection.analysis_complete.connect(self.on_analysis_complete)
-        self.file_selection.show()
-        
-        #updating the style
+        self._open_file_selection()
+
+        # updating the style
         self.app.setStyle("Fusion")
         light_palette = self.app.style().standardPalette()
         self.app.setPalette(light_palette)
@@ -72,6 +68,7 @@ class AppController:
         # Launch main window, keep reference
         self.main_window = MainWindow(
             frames=results["frames"],
+            display_channel=results.get("intensity_channel", 0),
             mask=results["masks"],
             rois=results["rois"],
             mean_intensities=results["mean_intensities"],
@@ -81,6 +78,11 @@ class AppController:
         )
         self.main_window.show()
 
+    def _open_file_selection(self):
+        self.file_selection = FileSelectionWindow()
+        self.file_selection.analysis_complete.connect(self.on_analysis_complete)
+        self.file_selection.show()
+
     def run(self):
         sys.exit(self.app.exec())
 
@@ -89,6 +91,4 @@ class AppController:
             self.main_window.close()
             self.main_window = None
 
-        self.file_selection = FileSelectionWindow()
-        self.file_selection.analysis_complete.connect(self.on_analysis_complete)
-        self.file_selection.show()
+        self._open_file_selection()

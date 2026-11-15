@@ -1,12 +1,34 @@
 from PySide6.QtWidgets import (
-    QWidget, QLabel, QHBoxLayout, QVBoxLayout, QToolButton, QFrame
+    QWidget,
+    QLabel,
+    QHBoxLayout,
+    QVBoxLayout,
+    QToolButton,
+    QFrame,
 )
-from PySide6.QtCore import Qt, Signal, QRectF, QSize
-from PySide6.QtGui import QPainter, QColor
+from PySide6.QtCore import Qt, Signal, QRectF, QSize, QLocale
+from PySide6.QtGui import QPainter, QColor, QDoubleValidator
+
+
+class DecimalValidator(QDoubleValidator):
+    """
+    Validates decimal numbers with a dot as decimal separator, whatever the system
+    locale. A typed comma is turned into a dot, so "0,25" on a German keyboard becomes
+    "0.25" and the text can always be read with float().
+    """
+
+    def __init__(self, bottom: float, top: float, decimals: int, parent=None):
+        super().__init__(bottom, top, decimals, parent)
+        self.setLocale(QLocale.c())
+        self.setNotation(QDoubleValidator.Notation.StandardNotation)
+
+    def validate(self, text: str, pos: int):
+        return super().validate(text.replace(",", "."), pos)
 
 
 class Slider(QWidget):
     """Inner slider that paints the track and knob."""
+
     toggled = Signal(bool)
 
     def __init__(self, width=50, height=20, parent=None):
@@ -21,11 +43,13 @@ class Slider(QWidget):
         painter.setRenderHint(QPainter.Antialiasing)
 
         # Theme colors
-        color_on = QColor("#DC5801")   # ON highlight
+        color_on = QColor("#DC5801")  # ON highlight
         color_off = QColor("#8D0F70")  # OFF highlight
 
         base = palette.base().color()
-        knob_color = palette.window().color() if base.lightness() < 128 else QColor("white")
+        knob_color = (
+            palette.window().color() if base.lightness() < 128 else QColor("white")
+        )
 
         # Track
         track_rect = QRectF(0, 0, self.width(), self.height())
@@ -56,6 +80,7 @@ class Slider(QWidget):
 
 class ToggleSwitch(QWidget):
     """Boolean toggle with labels outside the slider."""
+
     toggled = Signal(bool)
 
     def __init__(self, label_off="STD", label_on="CoV", parent=None):
@@ -72,15 +97,12 @@ class ToggleSwitch(QWidget):
         layout.addWidget(self.left_label)
 
         self.slider = Slider()
-        self.slider.toggled.connect(self._emit_signal)
+        self.slider.toggled.connect(self.toggled)
         layout.addWidget(self.slider)
 
         self.right_label = QLabel(self.label_on)
         self.right_label.setAlignment(Qt.AlignVCenter | Qt.AlignLeft)
         layout.addWidget(self.right_label)
-
-    def _emit_signal(self, state):
-        self.toggled.emit(state)
 
     def is_checked(self):
         return self.slider.is_checked()
@@ -100,6 +122,7 @@ class ToggleSwitch(QWidget):
 
 class CollapsibleBox(QWidget):
     """Collapsible box that adapts to theme colors."""
+
     def __init__(self, title="", parent=None, title_font_size=12, arrow_size=10):
         super().__init__(parent)
 
@@ -153,7 +176,9 @@ class CollapsibleBox(QWidget):
     def on_toggle(self):
         self._expanded = not self._expanded
         self.bg_frame.setVisible(self._expanded)
-        self.toggle_button.setArrowType(Qt.DownArrow if self._expanded else Qt.RightArrow)
+        self.toggle_button.setArrowType(
+            Qt.DownArrow if self._expanded else Qt.RightArrow
+        )
 
     def add_widget(self, widget):
         self.content_layout.addWidget(widget)
